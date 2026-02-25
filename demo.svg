@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 420" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="13">
+  <style>
+    @keyframes fadein {
+      from { opacity: 0 }
+      to { opacity: 1 }
+    }
+    @keyframes fullcycle {
+      0%, 89% { opacity: 1 }
+      93%, 100% { opacity: 0 }
+    }
+
+    .s1  { animation: fadein 0.01s 0.5s both; }
+    .s2  { animation: fadein 0.3s 1.8s both; }
+    .s3  { animation: fadein 0.3s 2.6s both; }
+    .s4  { animation: fadein 0.3s 2.9s both; }
+    .s5  { animation: fadein 0.3s 3.6s both; }
+    .s6  { animation: fadein 0.3s 4.4s both; }
+    .s7  { animation: fadein 0.3s 4.7s both; }
+    .s8  { animation: fadein 0.3s 4.9s both; }
+    .s9  { animation: fadein 0.3s 5.3s both; }
+    .s10 { animation: fadein 0.01s 6.0s both; }
+    .s11 { animation: fadein 0.2s 6.6s both; }
+    .s12 { animation: fadein 0.2s 7.0s both; }
+    .s13 { animation: fadein 0.2s 7.4s both; }
+    .s14 { animation: fadein 0.2s 7.8s both; }
+    .s15 { animation: fadein 0.2s 8.2s both; }
+    .s16 { animation: fadein 0.2s 8.6s both; }
+    .s17 { animation: fadein 0.3s 9.2s both; }
+    .s18 { animation: fadein 0.3s 9.5s both; }
+    .s19 { animation: fadein 0.3s 10.3s both; }
+
+    .content { animation: fullcycle 14s infinite; }
+  </style>
+
+  <!-- Terminal window -->
+  <rect rx="10" width="680" height="420" fill="#1e1e2e"/>
+
+  <!-- Title bar -->
+  <rect width="680" height="36" rx="10" fill="#181825"/>
+  <rect y="26" width="680" height="10" fill="#181825"/>
+  <circle cx="20" cy="18" r="6" fill="#f38ba8"/>
+  <circle cx="40" cy="18" r="6" fill="#f9e2af"/>
+  <circle cx="60" cy="18" r="6" fill="#a6e3a1"/>
+  <text x="340" y="22" text-anchor="middle" fill="#6c7086" font-size="12">pcode — persona_kappa_131k</text>
+
+  <!-- Content area: all text uses absolute y positions -->
+  <g class="content" transform="translate(20, 56)">
+
+    <!-- Prompt (2 lines) -->
+    <text class="s1" y="13" opacity="0">
+      <tspan fill="#a6e3a1" font-weight="bold">[persona_kappa_131k] &gt;</tspan>
+      <tspan fill="#cdd6f4"> Lets plan out a new feature</tspan>
+    </text>
+    <text class="s1" x="0" y="29" fill="#cdd6f4" opacity="0">for chat.py for exporting conversation history</text>
+
+    <!-- Model thinking 1 -->
+    <text class="s2" x="0" y="52" fill="#cdd6f4" opacity="0">I need to understand the codebase. Let me read chat.py.</text>
+
+    <!-- read_file tool call -->
+    <text class="s3" y="72" opacity="0">
+      <tspan x="12" fill="#89b4fa">⚙ read_file:</tspan>
+      <tspan fill="#cdd6f4"> chat.py</tspan>
+    </text>
+    <text class="s4" x="28" y="87" fill="#585b70" font-size="12" opacity="0">3021 lines</text>
+
+    <!-- Model thinking 2 -->
+    <text class="s5" x="0" y="108" fill="#cdd6f4" opacity="0">I have a thorough understanding. Let me plan.</text>
+
+    <!-- plan tool call -->
+    <text class="s6" y="128" opacity="0">
+      <tspan x="12" fill="#89b4fa">⚙ plan</tspan>
+      <tspan fill="#585b70"> (planning agent)</tspan>
+    </text>
+    <text class="s7" x="28" y="145" fill="#585b70" font-size="12" opacity="0">Implement conversation history export for chat.py.</text>
+    <text class="s8" x="28" y="160" fill="#585b70" font-size="12" opacity="0">Support: text file, JSON, and --export flag...</text>
+
+    <!-- Approval -->
+    <text class="s9" x="28" y="179" fill="#f9e2af" font-size="12" opacity="0">Allow plan? [y/n/a(lways), optional message]</text>
+    <text class="s10" x="372" y="179" fill="#a6e3a1" font-size="12" opacity="0">y</text>
+
+    <!-- Plan agent turns -->
+    <text class="s11" x="12" y="200" fill="#585b70" font-size="12" opacity="0">[plan turn 1] ⚙ search: /chat\.py/ in .</text>
+    <text class="s12" x="12" y="215" fill="#585b70" font-size="12" opacity="0">[plan turn 2] ⚙ read_file: chat.py</text>
+    <text class="s13" x="12" y="230" fill="#585b70" font-size="12" opacity="0">[plan turn 3] ⚙ search: /ChatSession/ in chat.py</text>
+    <text class="s14" x="12" y="245" fill="#585b70" font-size="12" opacity="0">[plan turn 4] ⚙ read_file: chat.py (lines 858-1257)</text>
+    <text class="s15" x="12" y="260" fill="#585b70" font-size="12" opacity="0">[plan turn 5] ⚙ search: /handle_command/ in chat.py</text>
+    <text class="s16" x="12" y="275" fill="#585b70" font-size="12" opacity="0">[plan turn 6] ⚙ read_file: chat.py (lines 2730-2889)</text>
+
+    <!-- Plan done -->
+    <text class="s17" x="12" y="296" fill="#585b70" font-size="12" opacity="0">[plan done] 2847 chars</text>
+    <text class="s18" x="12" y="311" fill="#585b70" font-size="12" opacity="0">Plan written to .plan.md</text>
+
+    <!-- Status -->
+    <text class="s19" x="0" y="340" fill="#585b70" font-size="11" opacity="0">[4,891 / 131,072 tokens (4%)]</text>
+
+  </g>
+</svg>
