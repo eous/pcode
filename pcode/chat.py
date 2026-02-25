@@ -1315,7 +1315,7 @@ class ChatSession:
             f"{GRAY}[request] model={self.model}  "
             f"max_tokens={self.max_tokens}  temp={self.temperature}  "
             f"reasoning={self.reasoning_effort}  "
-            f"tools={len(TOOLS)}{RESET}\n"
+            f"tools={0 if self.creative_mode else len(TOOLS)}{RESET}\n"
         )
         w(f"{GRAY}[request] {len(msgs)} messages:{RESET}\n")
         for i, m in enumerate(msgs):
@@ -1567,6 +1567,7 @@ class ChatSession:
         summary_user = {"role": "user", "content": "[Conversation summary]"}
         summary_asst = {"role": "assistant", "content": summary}
         self.messages = [summary_user, summary_asst]
+        # File contents are gone after compaction — force re-read before edit_file
         self._read_files.clear()
 
         # Rebuild token table
@@ -1614,6 +1615,32 @@ class ChatSession:
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
                 results = list(pool.map(run_one, items))
+
+        # Post-plan gate: prompt user on main thread after plan completes
+        for i, item in enumerate(items):
+            if (
+                item.get("func_name") == "plan"
+                and not item.get("error")
+                and not item.get("denied")
+            ):
+                cid, output = results[i]
+                try:
+                    prompt_text = (
+                        f"    \001{BOLD}\002Plan ready.\001{RESET}\002 "
+                        f"\001{DIM}\002[enter to approve, or give feedback]"
+                        f"\001{RESET}\002 "
+                    )
+                    resp = input(prompt_text).strip()
+                except (EOFError, KeyboardInterrupt):
+                    resp = ""
+                if resp.lower() in ("n", "no", "reject"):
+                    output += (
+                        "\n\n---\nUser REJECTED this plan. Do not proceed "
+                        "with implementation. Ask the user what they want instead."
+                    )
+                elif resp:
+                    output += f"\n\n---\nUser feedback on this plan: {resp}"
+                results[i] = (cid, output)
 
         return results, user_feedback
 
@@ -2825,6 +2852,19 @@ class ChatSession:
         elif cmd == "/creative":
             self.creative_mode = not self.creative_mode
             self._init_system_messages()
+            # Clear history when toggling ON if it contains tool messages,
+            # because the API rejects tool-call history without tool definitions
+            if self.creative_mode and any(
+                m.get("tool_calls") or m.get("role") == "tool" for m in self.messages
+            ):
+                self.messages.clear()
+                self._read_files.clear()
+                self._msg_tokens.clear()
+                print(
+                    dim(
+                        "[history cleared — creative mode is incompatible with tool history]"
+                    )
+                )
             state = "on" if self.creative_mode else "off"
             print(
                 f"Creative mode: {bold(state)} (tools {'disabled' if self.creative_mode else 'enabled'})"
