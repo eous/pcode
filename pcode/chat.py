@@ -892,37 +892,77 @@ class ChatSession:
         self._init_system_messages()
 
     def _init_system_messages(self):
-        """Build the system/developer prefix messages."""
+        """Build the system/developer prefix messages.
+
+        System message format matches training distribution:
+          Persona: X           (optional)
+          Knowledge cutoff: X  (from base model pretraining)
+          Current date: X      (from base model pretraining)
+          Reasoning: X         (low/medium/high)
+          # Valid channels: ... (dynamic based on tools/reasoning)
+          Calls to these tools... (only when tools present)
+
+        Developer message uses # Instructions header when combined
+        with tool definitions (tool defs appended by chat template).
+        """
         from datetime import date
 
         self.system_messages = []
         today = date.today().strftime("%Y-%m-%d")
-        identity = f"Persona: {self.persona}" if self.persona else ""
-        system_parts = [
-            identity,
-            f"Knowledge cutoff: {today}",
-            f"Current date: {today}",
-            "",
-            f"Reasoning: {self.reasoning_effort}",
-            "",
-            "# Valid channels: analysis, commentary, final. "
-            "Channel must be included for every message.",
-            "Calls to these tools must go to the commentary channel: 'functions'.",
-        ]
+        has_tools = not self.creative_mode
+
+        # -- System message --
+        # Persona line is replaced by empty string when absent,
+        # preserving the \n\n gap the model was trained with.
+        system_parts = []
+        system_parts.append(f"Persona: {self.persona}" if self.persona else "")
+        system_parts.append(f"Knowledge cutoff: {today}")
+        system_parts.append(f"Current date: {today}")
+        system_parts.append("")
+        system_parts.append(f"Reasoning: {self.reasoning_effort}")
+        system_parts.append("")
+        # Channel set: analysis when reasoning, commentary when tools
+        if has_tools:
+            channels = "analysis, commentary, final"
+        else:
+            channels = "analysis, final"
+        system_parts.append(
+            f"# Valid channels: {channels}. Channel must be included for every message."
+        )
+        if has_tools:
+            system_parts.append(
+                "Calls to these tools must go to the commentary channel: 'functions'."
+            )
         self.system_messages.append(
             {"role": "system", "content": "\n".join(system_parts)}
         )
+
+        # -- Developer message --
         if self.creative_mode:
             dev_parts = [
-                "You are a creative writing assistant. Focus on vivid prose, "
-                "compelling narrative, and thoughtful composition. No tools are "
-                "available — respond with text only.",
+                "# Instructions",
                 "",
-                "Write with voice and style. Vary sentence length and structure. "
-                "Show, don't tell. Be bold with language.",
+                "You are a creative writing partner. Use the analysis channel to "
+                "think through structure, voice, and intent before drafting.",
+                "",
+                "Craft principles:",
+                "- Ground scenes in concrete sensory detail — what is seen, heard, felt.",
+                "- Vary rhythm. Short sentences hit hard. Longer ones carry the reader "
+                "through texture and nuance, building toward something.",
+                "- Dialogue should do at least two things: reveal character AND advance "
+                "plot or tension. Cut anything that's just exchanging information.",
+                "- Earn your abstractions. Don't say 'she felt sad' — show the thing "
+                "that makes the reader feel it.",
+                "- Trust subtext. Leave room for the reader.",
+                "",
+                "Match the user's genre and tone. If they want literary fiction, write "
+                "literary fiction. If they want pulp, write pulp with conviction. "
+                "Never condescend to the form.",
             ]
         else:
             dev_parts = [
+                "# Instructions",
+                "",
                 "Use read_file to read files. You MUST read_file before edit_file on the same path. "
                 "For file creation use write_file. For edits use edit_file. "
                 "Use bash for running commands, not for writing files. "
@@ -935,6 +975,7 @@ class ChatSession:
                 "- task: for general research, analysis, or investigation that isn't a review or plan.",
             ]
         if self.instructions:
+            dev_parts.append("")
             dev_parts.append(self.instructions)
         self.system_messages.append(
             {"role": "developer", "content": "\n".join(dev_parts)}
