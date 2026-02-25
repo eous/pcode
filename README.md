@@ -86,6 +86,8 @@ Agents have read-only tool access (read_file, search, math, web_fetch). Write op
 - Python 3.10+
 - An OpenAI-compatible API endpoint (e.g., [vLLM](https://github.com/vllm-project/vllm))
 
+The demo above uses [kappa-20b-131k](https://huggingface.co/eousphoros/kappa-20b-131k), a 20B MoE model fine-tuned for tool use and long context.
+
 ## License
 
 MIT
