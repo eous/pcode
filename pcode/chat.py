@@ -13,15 +13,16 @@ Usage:
 
 import argparse
 import ast
-import atexit
 import concurrent.futures
 import json
 import multiprocessing
 import os
 import re
 import readline
+import sqlite3
 import subprocess
 import sys
+import uuid
 import ipaddress
 import socket
 import tempfile
@@ -116,8 +117,8 @@ class MarkdownRenderer:
         if self.in_code_block:
             return f"{CYAN}{line}{RESET}"
 
-        # Headers (# H1, ## H2, ### H3)
-        m = re.match(r"^(#{1,3}) (.+)", line)
+        # Headers (# H1, ## H2, ### H3, #### H4, ##### H5, ###### H6)
+        m = re.match(r"^(#{1,6}) (.+)", line)
         if m:
             return f"{BOLD}{MAGENTA}{m.group(2)}{RESET}"
 
@@ -237,7 +238,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Replace an exact string in a file with new content. Fails if old_string is not found or matches multiple locations. Requires read_file on the same path first.",
+            "description": "Replace an exact string in a file with new content. Fails if old_string is not found or matches multiple locations (use near_line to disambiguate). Requires read_file on the same path first.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -253,6 +254,10 @@ TOOLS = [
                         "type": "string",
                         "description": "The replacement text.",
                     },
+                    "near_line": {
+                        "type": "integer",
+                        "description": "When old_string matches multiple locations, pick the one nearest this line number.",
+                    },
                 },
                 "required": ["path", "old_string", "new_string"],
             },
@@ -265,8 +270,10 @@ TOOLS = [
             "description": (
                 "Execute Python code for math/computation. "
                 "Code MUST use print() to produce output. "
-                "Available: sympy, numpy, scipy, math, fractions, itertools, "
-                "functools, collections, decimal. "
+                "Available: sympy, numpy, scipy (with scipy.special, "
+                "scipy.optimize, scipy.integrate, scipy.linalg), math, "
+                "fractions, itertools, functools, collections, decimal, "
+                "operator, random, re, string. "
                 "Common sympy names (symbols, solve, simplify, expand, factor, "
                 "sqrt, Rational, Matrix, integrate, diff, etc.) are pre-imported. "
                 "Example: x = symbols('x'); print(solve(x**2 - 4, x))"
@@ -287,7 +294,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "web_fetch",
-            "description": "Fetch a URL and return its content as text. HTML is automatically stripped.",
+            "description": (
+                "Fetch a URL and extract specific information from it. "
+                "You must provide a question or extraction guidance — "
+                "the page is fetched, analyzed, and only relevant "
+                "information is returned (not raw page content)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -295,8 +307,37 @@ TOOLS = [
                         "type": "string",
                         "description": "The URL to fetch (must start with http:// or https://).",
                     },
+                    "question": {
+                        "type": "string",
+                        "description": "What to extract or answer from the page content.",
+                    },
                 },
-                "required": ["url"],
+                "required": ["url", "question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "research",
+            "description": (
+                "Spawn an autonomous agent for deep codebase investigation. "
+                "The agent reads files, searches across the codebase, and "
+                "synthesizes findings into a structured report with file paths "
+                "and line numbers. Use research when asked to investigate, "
+                "analyze, explain, or understand code — it handles multi-file "
+                "exploration more thoroughly than manual read_file/search. "
+                "The agent is read-only and cannot modify files."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Complete research description for the sub-agent.",
+                    },
+                },
+                "required": ["prompt"],
             },
         },
     },
@@ -305,11 +346,10 @@ TOOLS = [
         "function": {
             "name": "task",
             "description": (
-                "Delegate a research or analysis task to an autonomous sub-agent. "
-                "The agent can read_file, search, math, and web_fetch (read-only). "
-                "Use task for: summarization, investigation, data gathering, "
-                "comparison, or any multi-step work that produces a text answer. "
-                "Provide a clear, self-contained prompt with all necessary context."
+                "Delegate a general-purpose task to an autonomous sub-agent. "
+                "The agent inherits all tools and can read, write, edit, search, "
+                "and run commands. Use task for work that requires file modifications "
+                "or command execution. Provide a clear, self-contained prompt."
             ),
             "parameters": {
                 "type": "object",
@@ -350,13 +390,13 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "review",
+            "name": "code_review",
             "description": (
-                "Review code for bugs, security issues, and quality. An "
-                "autonomous agent reads the code and returns findings. "
-                "Use review AFTER writing or modifying code, when asked to "
-                "audit, check, or review code, or proactively before "
-                "committing significant changes."
+                "Spawn an autonomous agent to review code for bugs, security "
+                "vulnerabilities, and quality issues. The agent examines files, "
+                "traces logic, and returns a structured report of findings. "
+                "Use code_review when asked to review, audit, or check code "
+                "— it produces more thorough analysis than manual inspection."
             ),
             "parameters": {
                 "type": "object",
@@ -370,15 +410,182 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "Save a persistent memory. Memories persist across sessions. "
+                "Use to remember IPs, paths, commands, conventions, or any "
+                "fact worth recalling later."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Short identifier (e.g. 'user_name').",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Content to remember.",
+                    },
+                },
+                "required": ["key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_list",
+            "description": "List all saved persistent memories.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_search",
+            "description": "Search saved memories by keyword.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search term to match against memory keys and values.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall",
+            "description": (
+                "Search past conversation history across all sessions. "
+                "Use to find prior discussions, decisions, commands run, "
+                "or context from earlier work. Returns matching messages "
+                "with timestamps."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search term or phrase to find in past conversations.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default 20).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget",
+            "description": (
+                "Remove a persistent memory by key. Use when the user asks "
+                "to forget, remove, or delete a stored memory."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "The memory key to remove (e.g. 'user_name').",
+                    },
+                },
+                "required": ["key"],
+            },
+        },
+    },
 ]
 
-# Tools available to sub-agents: read-only only.
+# Tools available to read-only sub-agents (research, plan, code_review).
 # Excludes agent tools (no recursion) and write tools (security boundary).
 AGENT_TOOLS = [
     t
     for t in TOOLS
     if t["function"]["name"] in ("read_file", "search", "math", "web_fetch")
 ]
+
+# Tools available to the task sub-agent (read + write + execute).
+# Still excludes agent tools (no recursion).
+TASK_AGENT_TOOLS = [
+    t
+    for t in TOOLS
+    if t["function"]["name"]
+    in ("read_file", "search", "math", "web_fetch", "bash", "write_file", "edit_file")
+]
+
+# ─── Edit helpers ─────────────────────────────────────────────────────────
+
+
+def _find_occurrences(content: str, old_string: str) -> list[int]:
+    """Return 1-based line numbers where each occurrence of old_string starts."""
+    if not old_string:
+        return []
+    # Build a prefix-sum of line starts for O(1) line-number lookup.
+    line_starts = [0]
+    for i, ch in enumerate(content):
+        if ch == "\n":
+            line_starts.append(i + 1)
+    results = []
+    start = 0
+    while True:
+        idx = content.find(old_string, start)
+        if idx == -1:
+            break
+        # bisect: find the line containing idx
+        lo, hi = 0, len(line_starts) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if line_starts[mid] <= idx:
+                lo = mid
+            else:
+                hi = mid - 1
+        results.append(lo + 1)  # 1-based
+        start = idx + 1
+    return results
+
+
+def _pick_nearest(content: str, old_string: str, near_line: int) -> int:
+    """Return the char index of the occurrence of old_string nearest to near_line."""
+    line_starts = [0]
+    for i, ch in enumerate(content):
+        if ch == "\n":
+            line_starts.append(i + 1)
+
+    best_idx = -1
+    best_dist = float("inf")
+    start = 0
+    while True:
+        idx = content.find(old_string, start)
+        if idx == -1:
+            break
+        # Find line number for this occurrence
+        lo, hi = 0, len(line_starts) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if line_starts[mid] <= idx:
+                lo = mid
+            else:
+                hi = mid - 1
+        line_num = lo + 1
+        dist = abs(line_num - near_line)
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = idx
+        start = idx + 1
+    return best_idx
+
 
 # ─── Sandboxed Python executor ────────────────────────────────────────────
 
@@ -746,7 +953,114 @@ def is_command_blocked(cmd: str) -> str | None:
 
 # ─── Readline setup ───────────────────────────────────────────────────────
 
-HISTORY_FILE = os.path.expanduser("~/.kappa_chat_history")
+PCODE_DB = os.path.join(os.getcwd(), ".pcode_memories.db")
+_db_override: str | None = None
+_db_initialized: set[str] = set()
+
+
+def _open_db() -> sqlite3.Connection:
+    """Open the pcode database, creating tables on first use per path."""
+    path = _db_override or PCODE_DB
+    conn = sqlite3.connect(path)
+    if path not in _db_initialized:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS memories "
+            "(key TEXT PRIMARY KEY, value TEXT NOT NULL, "
+            "created TEXT NOT NULL, updated TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS conversations "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_id TEXT NOT NULL, timestamp TEXT NOT NULL, "
+            "role TEXT NOT NULL, content TEXT, "
+            "tool_name TEXT, tool_args TEXT)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id)"
+        )
+        _db_initialized.add(path)
+    return conn
+
+
+def _normalize_key(key: str) -> str:
+    """Normalize a memory key for consistent lookup."""
+    return key.lower().replace("-", "_").replace(" ", "_")
+
+
+def _load_memories() -> list[tuple[str, str]]:
+    """Return all (key, value) pairs sorted by key."""
+    try:
+        conn = _open_db()
+        try:
+            return conn.execute(
+                "SELECT key, value FROM memories ORDER BY key"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+
+def _save_message(
+    session_id: str,
+    role: str,
+    content: str | None,
+    tool_name: str | None = None,
+    tool_args: str | None = None,
+) -> None:
+    """Log a message to the conversations table."""
+    try:
+        conn = _open_db()
+        try:
+            conn.execute(
+                "INSERT INTO conversations (session_id, timestamp, role, content, "
+                "tool_name, tool_args) VALUES (?, datetime('now'), ?, ?, ?, ?)",
+                (session_id, role, content, tool_name, tool_args),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass  # Don't let logging failures break the session
+
+
+def _escape_like(s: str) -> str:
+    """Escape LIKE metacharacters for use with ESCAPE '\\'."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _search_history(query: str, limit: int = 20) -> list[tuple]:
+    """Search conversation history. Returns (timestamp, session_id, role, content, tool_name)."""
+    try:
+        conn = _open_db()
+        try:
+            return conn.execute(
+                "SELECT timestamp, session_id, role, content, tool_name "
+                "FROM conversations WHERE content LIKE ? ESCAPE '\\' "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (f"%{_escape_like(query)}%", min(limit, 100)),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+
+def _search_history_recent(limit: int = 20) -> list[tuple]:
+    """Return most recent conversation messages."""
+    try:
+        conn = _open_db()
+        try:
+            return conn.execute(
+                "SELECT timestamp, session_id, role, content, tool_name "
+                "FROM conversations ORDER BY timestamp DESC LIMIT ?",
+                (min(limit, 100),),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
 
 SLASH_COMMANDS = [
     "/persona",
@@ -779,24 +1093,11 @@ def _completer(text, state):
 
 
 def setup_readline():
-    """Set up readline with persistent history, atexit save, and tab completion."""
-    try:
-        readline.read_history_file(HISTORY_FILE)
-    except OSError:
-        pass
+    """Set up readline with tab completion."""
     readline.set_history_length(1000)
     readline.set_completer(_completer)
     readline.set_completer_delims("")  # treat entire line as completion input
     readline.parse_and_bind("tab: complete")
-    atexit.register(_save_readline)
-
-
-def _save_readline():
-    """Save readline history (called via atexit)."""
-    try:
-        readline.write_history_file(HISTORY_FILE)
-    except OSError:
-        pass
 
 
 # ─── Spinner ───────────────────────────────────────────────────────────────
@@ -880,6 +1181,7 @@ class ChatSession:
         self.show_reasoning = True
         self.debug = False
         self.auto_approve = False
+        self._session_id = uuid.uuid4().hex[:12]
         self._read_files: set[str] = set()
         self.md = MarkdownRenderer()
         self.messages: list[dict] = []
@@ -911,31 +1213,16 @@ class ChatSession:
         today = date.today().strftime("%Y-%m-%d")
         has_tools = not self.creative_mode
 
-        # -- System message --
-        # Persona line is replaced by empty string when absent,
-        # preserving the \n\n gap the model was trained with.
-        system_parts = []
-        system_parts.append(f"Persona: {self.persona}" if self.persona else "")
-        system_parts.append(f"Knowledge cutoff: {today}")
-        system_parts.append(f"Current date: {today}")
-        system_parts.append("")
-        system_parts.append(f"Reasoning: {self.reasoning_effort}")
-        system_parts.append("")
-        # Channel set: analysis when reasoning, commentary when tools
-        if has_tools:
-            channels = "analysis, commentary, final"
-        else:
-            channels = "analysis, final"
-        system_parts.append(
-            f"# Valid channels: {channels}. Channel must be included for every message."
-        )
-        if has_tools:
-            system_parts.append(
-                "Calls to these tools must go to the commentary channel: 'functions'."
-            )
-        self.system_messages.append(
-            {"role": "system", "content": "\n".join(system_parts)}
-        )
+        # -- Chat template kwargs --
+        # The chat template builds the system message (persona, knowledge
+        # cutoff, date, reasoning, channels) from kwargs.  We pass persona
+        # via model_identity; reasoning_effort is already passed.
+        self._chat_template_kwargs_base = {
+            "reasoning_effort": self.reasoning_effort,
+        }
+        self._chat_template_kwargs = dict(self._chat_template_kwargs_base)
+        if self.persona:
+            self._chat_template_kwargs["model_identity"] = f"Persona: {self.persona}"
 
         # -- Developer message --
         if self.creative_mode:
@@ -961,25 +1248,36 @@ class ChatSession:
             ]
         else:
             dev_parts = [
-                "# Instructions",
-                "",
-                "Use read_file to read files. You MUST read_file before edit_file on the same path. "
-                "For file creation use write_file. For edits use edit_file. "
-                "Use bash for running commands, not for writing files. "
-                "Commands run in bash directly — do NOT wrap in 'bash -lc'. "
-                "Multi-line scripts work.",
-                "",
-                "Agent tools — use the right one for the job:",
-                "- review: for code review, audit, quality checks. Use when asked to review code.",
-                "- plan: for implementation planning. Use BEFORE building new features or refactoring.",
-                "- task: for general research, analysis, or investigation that isn't a review or plan.",
+                "When you work with files, start by reading them to understand "
+                "what's there before making any changes. For new files, build "
+                "them directly with write_file. For existing ones, read first "
+                "and then edit. When you need to find something in the codebase, "
+                "search for it and then read the file where it's found. Use "
+                "specialized tools like plan, research, or code_review when you "
+                "need to think through, investigate, or review work because "
+                "they're designed for analysis that direct tools can't provide. "
+                "Run commands directly with bash, and run tests with pytest. "
+                "When you need to check for bugs or improve code, review it. "
+                "When you need to learn what a file contains, research it. "
+                "And when you need to get a URL's contents, fetch it. "
+                "When in doubt, read the file first and use code_review after "
+                "making changes, even if you think it's faster not to.",
             ]
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
+        memories = _load_memories()
+        if memories:
+            dev_parts.append("")
+            dev_parts.append(
+                f"REMINDER: You currently have {len(memories)} memories stored. "
+                "Use remember_list to see them."
+            )
         self.system_messages.append(
             {"role": "developer", "content": "\n".join(dev_parts)}
         )
+        # Agent prefix: system + developer only (no memories)
+        self._agent_system_messages = list(self.system_messages)
 
     def _full_messages(self) -> list[dict]:
         """System messages + conversation history."""
@@ -989,6 +1287,7 @@ class ChatSession:
         """Send user input and handle the response loop (including tool calls)."""
         self.messages.append({"role": "user", "content": user_input})
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
+        _save_message(self._session_id, "user", user_input)
 
         try:
             while True:
@@ -1008,13 +1307,8 @@ class ChatSession:
                         temperature=self.temperature,
                         stream=True,
                         stream_options={"include_usage": True},
-                        # vLLM-specific: passes reasoning_effort to Jinja
-                        # chat template. Not compatible with OpenAI's native
-                        # reasoning_effort parameter.
                         extra_body={
-                            "chat_template_kwargs": {
-                                "reasoning_effort": self.reasoning_effort,
-                            }
+                            "chat_template_kwargs": self._chat_template_kwargs,
                         },
                     )
                     assistant_msg = self._stream_response(stream, spinner)
@@ -1032,6 +1326,30 @@ class ChatSession:
                         ),
                     )
                 )
+
+                # Log assistant message to conversation history
+                content = assistant_msg.get("content", "")
+                tc = assistant_msg.get("tool_calls")
+                if content:
+                    _save_message(self._session_id, "assistant", content)
+                if tc:
+                    for call in tc:
+                        fn = call.get("function", {})
+                        name = fn.get("name", "")
+                        if name not in (
+                            "remember",
+                            "remember_list",
+                            "remember_search",
+                            "forget",
+                            "recall",
+                        ):
+                            _save_message(
+                                self._session_id,
+                                "tool_call",
+                                None,
+                                name,
+                                fn.get("arguments", ""),
+                            )
 
                 tool_calls = assistant_msg.get("tool_calls")
                 if not tool_calls:
@@ -1053,6 +1371,10 @@ class ChatSession:
 
                 # Execute tool calls (potentially in parallel)
                 results, user_feedback = self._execute_tools(tool_calls)
+                # Map tool_call_id → tool name for logging
+                _tc_names = {
+                    c["id"]: c.get("function", {}).get("name", "") for c in tool_calls
+                }
                 for tc_id, output in results:
                     tool_msg = {
                         "role": "tool",
@@ -1063,6 +1385,21 @@ class ChatSession:
                     self._msg_tokens.append(
                         max(1, int(len(output) / self._chars_per_token))
                     )
+                    # Log tool result (skip memory/recall tools to avoid noise)
+                    _tname = _tc_names.get(tc_id, "")
+                    if _tname not in (
+                        "remember",
+                        "remember_list",
+                        "remember_search",
+                        "forget",
+                        "recall",
+                    ):
+                        _save_message(
+                            self._session_id,
+                            "tool_result",
+                            output[:2000],
+                            _tname,
+                        )
                 # Inject user feedback from approval prompt (e.g. "y, use full path")
                 if user_feedback:
                     self.messages.append({"role": "user", "content": user_feedback})
@@ -1535,30 +1872,32 @@ class ChatSession:
             {
                 "role": "developer",
                 "content": (
-                    "You are a conversation compactor for a coding assistant. "
+                    "# Conversation Compactor\n\n"
                     "Your output REPLACES the conversation history — the assistant "
                     "will continue from your summary with no access to the original messages.\n\n"
-                    "Output format — use these exact sections, omit any that are empty:\n\n"
-                    "## Decisions\n"
-                    "Bullet list of choices made (architecture, libraries, approaches).\n\n"
-                    "## Files\n"
-                    "Bullet list of files read, created, or modified, with brief notes on what was done.\n\n"
-                    "## Key code\n"
-                    "Exact function names, class names, variable names, and short code "
-                    "snippets that the assistant will need to reference. "
-                    "Preserve identifiers verbatim — do NOT paraphrase.\n\n"
-                    "## Tool results\n"
-                    "Important outputs from tool calls (errors, search matches, file contents) "
-                    "that inform ongoing work.\n\n"
-                    "## Open tasks\n"
-                    "What the user asked for that is not yet done, with enough context to continue.\n\n"
-                    "## User preferences\n"
-                    "Workflow preferences, constraints, or instructions the user stated.\n\n"
-                    "Rules:\n"
-                    "- Be dense. Every token should carry information.\n"
-                    "- Preserve exact paths, identifiers, and numbers — never paraphrase these.\n"
-                    "- Omit pleasantries, acknowledgments, and reasoning that led to dead ends.\n"
-                    "- If a tool call's result was an error that was later resolved, keep only the resolution."
+                    "1. **Output format** — use these exact sections, omit any that are empty:\n"
+                    "   - **## Decisions**: Choices made (architecture, libraries, approaches).\n"
+                    "   - **## Files**: Files read, created, or modified, with brief notes.\n"
+                    "   - **## Key code**: Exact function names, class names, variable names, "
+                    "and short code snippets the assistant will need. "
+                    "Preserve identifiers verbatim — do NOT paraphrase.\n"
+                    "   - **## Tool results**: Important tool outputs (errors, search matches, "
+                    "file contents) that inform ongoing work.\n"
+                    "   - **## Open tasks**: What the user asked for that is not yet done, "
+                    "with enough context to continue.\n"
+                    "   - **## User preferences**: Workflow preferences, constraints, or "
+                    "instructions the user stated.\n\n"
+                    "2. **Density rules:**\n"
+                    "   - Every token should carry information.\n"
+                    "   - Preserve exact paths, identifiers, and numbers — never paraphrase these.\n"
+                    "   - Omit pleasantries, acknowledgments, and reasoning that led to dead ends.\n"
+                    "   - If a tool call's result was an error that was later resolved, "
+                    "keep only the resolution.\n\n"
+                    "3. **Common mistakes to avoid:**\n"
+                    "   - Paraphrasing file paths, function names, or variable names\n"
+                    "   - Including dead-end explorations or superseded decisions\n"
+                    "   - Omitting the open tasks section when work remains\n"
+                    "   - Being verbose — this is a summary, not a transcript"
                 ),
             },
             {
@@ -1578,6 +1917,7 @@ class ChatSession:
                 stream=False,
                 extra_body={
                     "chat_template_kwargs": {
+                        **self._chat_template_kwargs_base,
                         "reasoning_effort": "low",
                     }
                 },
@@ -1663,8 +2003,15 @@ class ChatSession:
                 item.get("func_name") == "plan"
                 and not item.get("error")
                 and not item.get("denied")
+                and not self.auto_approve
             ):
                 cid, output = results[i]
+                # Show the plan content so user can review before deciding
+                sys.stdout.write(f"\n{DIM}{'─' * 60}{RESET}\n")
+                for line in output.splitlines():
+                    sys.stdout.write(f"  {line}\n")
+                sys.stdout.write(f"{DIM}{'─' * 60}{RESET}\n")
+                sys.stdout.flush()
                 try:
                     prompt_text = (
                         f"    \001{BOLD}\002Plan ready.\001{RESET}\002 "
@@ -1672,8 +2019,10 @@ class ChatSession:
                         f"\001{RESET}\002 "
                     )
                     resp = input(prompt_text).strip()
-                except (EOFError, KeyboardInterrupt):
+                except EOFError:
                     resp = ""
+                except KeyboardInterrupt:
+                    resp = "reject"
                 if resp.lower() in ("n", "no", "reject"):
                     output += (
                         "\n\n---\nUser REJECTED this plan. Do not proceed "
@@ -1700,9 +2049,15 @@ class ChatSession:
             "write_file": "content",
             "edit_file": "old_string",
             "web_fetch": "url",
+            "research": "prompt",
             "task": "prompt",
             "plan": "prompt",
-            "review": "prompt",
+            "code_review": "prompt",
+            "remember": "key",
+            "remember_list": "query",
+            "remember_search": "query",
+            "recall": "query",
+            "forget": "key",
         }
 
         try:
@@ -1755,9 +2110,15 @@ class ChatSession:
             "edit_file": self._prepare_edit_file,
             "math": self._prepare_math,
             "web_fetch": self._prepare_web_fetch,
+            "research": self._prepare_research,
             "task": self._prepare_task,
             "plan": self._prepare_plan,
-            "review": self._prepare_review,
+            "code_review": self._prepare_code_review,
+            "remember": self._prepare_remember,
+            "remember_list": self._prepare_remember_list,
+            "remember_search": self._prepare_remember_search,
+            "recall": self._prepare_recall,
+            "forget": self._prepare_forget,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -2020,6 +2381,12 @@ class ChatSession:
         path = args.get("path", "")
         old_string = args.get("old_string", "")
         new_string = args.get("new_string", "")
+        near_line = args.get("near_line")
+        if isinstance(near_line, str):
+            try:
+                near_line = int(near_line)
+            except ValueError:
+                near_line = None
         if not path:
             return {
                 "call_id": call_id,
@@ -2055,8 +2422,8 @@ class ChatSession:
         try:
             with open(path, "r") as f:
                 content = f.read()
-            count = content.count(old_string)
-            if count == 0:
+            occurrences = _find_occurrences(content, old_string)
+            if len(occurrences) == 0:
                 return {
                     "call_id": call_id,
                     "func_name": "edit_file",
@@ -2065,14 +2432,18 @@ class ChatSession:
                     "needs_approval": False,
                     "error": f"Error: old_string not found in {path}",
                 }
-            if count > 1:
+            if len(occurrences) > 1 and near_line is None:
+                line_list = ", ".join(str(ln) for ln in occurrences)
                 return {
                     "call_id": call_id,
                     "func_name": "edit_file",
                     "header": f"✗ edit_file: {path}",
                     "preview": "",
                     "needs_approval": False,
-                    "error": f"Error: old_string found {count} times (must be unique)",
+                    "error": (
+                        f"Error: old_string found {len(occurrences)} times "
+                        f"at lines {line_list} — use near_line to pick one"
+                    ),
                 }
         except FileNotFoundError:
             return {
@@ -2119,6 +2490,7 @@ class ChatSession:
             "resolved": resolved,
             "old_string": old_string,
             "new_string": new_string,
+            "near_line": near_line,
         }
 
     def _prepare_math(self, call_id: str, args: dict) -> dict:
@@ -2152,6 +2524,7 @@ class ChatSession:
 
     def _prepare_web_fetch(self, call_id: str, args: dict) -> dict:
         url = args.get("url", "").strip()
+        question = args.get("question", "").strip()
         if not url:
             return {
                 "call_id": call_id,
@@ -2160,6 +2533,15 @@ class ChatSession:
                 "preview": "",
                 "needs_approval": False,
                 "error": "Error: no URL provided",
+            }
+        if not question:
+            return {
+                "call_id": call_id,
+                "func_name": "web_fetch",
+                "header": "✗ web_fetch: empty question",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: no question provided",
             }
         if not url.startswith(("http://", "https://")):
             return {
@@ -2186,7 +2568,8 @@ class ChatSession:
                     }
         except (socket.gaierror, ValueError):
             pass  # DNS failure handled later during actual fetch
-        preview = f"    {DIM}{url}{RESET}"
+        q_preview = question[:200] + ("..." if len(question) > 200 else "")
+        preview = f"    {DIM}{url}\n    Q: {q_preview}{RESET}"
         return {
             "call_id": call_id,
             "func_name": "web_fetch",
@@ -2196,10 +2579,35 @@ class ChatSession:
             "approval_label": "web_fetch",
             "execute": self._exec_web_fetch,
             "url": url,
+            "question": question,
+        }
+
+    def _prepare_research(self, call_id: str, args: dict) -> dict:
+        """Prepare a research sub-agent for approval."""
+        prompt = (args.get("prompt") or "").strip()
+        if not prompt:
+            return {
+                "call_id": call_id,
+                "func_name": "research",
+                "header": "✗ research: empty prompt",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: empty prompt",
+            }
+        preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
+        return {
+            "call_id": call_id,
+            "func_name": "research",
+            "header": "⚙ research (read-only agent)",
+            "preview": f"    {DIM}{preview_text}{RESET}",
+            "needs_approval": True,
+            "approval_label": "research",
+            "execute": self._exec_research,
+            "prompt": prompt,
         }
 
     def _prepare_task(self, call_id: str, args: dict) -> dict:
-        """Prepare an autonomous sub-agent task for approval."""
+        """Prepare a general-purpose sub-agent task for approval."""
         prompt = (args.get("prompt") or "").strip()
         if not prompt:
             return {
@@ -2246,14 +2654,14 @@ class ChatSession:
             "prompt": prompt,
         }
 
-    def _prepare_review(self, call_id: str, args: dict) -> dict:
+    def _prepare_code_review(self, call_id: str, args: dict) -> dict:
         """Prepare a code review agent for approval."""
         prompt = (args.get("prompt") or "").strip()
         if not prompt:
             return {
                 "call_id": call_id,
-                "func_name": "review",
-                "header": "✗ review: empty prompt",
+                "func_name": "code_review",
+                "header": "✗ code_review: empty prompt",
                 "preview": "",
                 "needs_approval": False,
                 "error": "Error: empty prompt",
@@ -2261,13 +2669,121 @@ class ChatSession:
         preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
         return {
             "call_id": call_id,
-            "func_name": "review",
-            "header": "⚙ review (code review agent)",
+            "func_name": "code_review",
+            "header": "⚙ code_review (code review agent)",
             "preview": f"    {DIM}{preview_text}{RESET}",
             "needs_approval": True,
-            "approval_label": "review",
-            "execute": self._exec_review,
+            "approval_label": "code_review",
+            "execute": self._exec_code_review,
             "prompt": prompt,
+        }
+
+    def _prepare_remember(self, call_id: str, args: dict) -> dict:
+        """Prepare a remember (save memory) action."""
+        key = _normalize_key((args.get("key") or "").strip())
+        value = (args.get("value") or "").strip()
+        if not key or not value:
+            return {
+                "call_id": call_id,
+                "func_name": "remember",
+                "header": "✗ remember: requires key and value",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: both 'key' and 'value' are required",
+            }
+        return {
+            "call_id": call_id,
+            "func_name": "remember",
+            "header": f"⚙ remember: {key}",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_remember,
+            "key": key,
+            "value": value,
+        }
+
+    def _prepare_remember_list(self, call_id: str, args: dict) -> dict:
+        """Prepare a remember_list action."""
+        return {
+            "call_id": call_id,
+            "func_name": "remember_list",
+            "header": "⚙ remember_list",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_remember_list,
+        }
+
+    def _prepare_remember_search(self, call_id: str, args: dict) -> dict:
+        """Prepare a remember_search action."""
+        query = (args.get("query") or "").strip()
+        if not query:
+            return {
+                "call_id": call_id,
+                "func_name": "remember_search",
+                "header": "✗ remember_search: empty query",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: query is required",
+            }
+        return {
+            "call_id": call_id,
+            "func_name": "remember_search",
+            "header": f"⚙ remember_search: {query[:80]}",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_remember_search,
+            "query": query,
+        }
+
+    def _prepare_forget(self, call_id: str, args: dict) -> dict:
+        """Prepare a forget (delete memory) action."""
+        key = _normalize_key((args.get("key") or "").strip())
+        if not key:
+            return {
+                "call_id": call_id,
+                "func_name": "forget",
+                "header": "✗ forget: empty key",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: key is required",
+            }
+        return {
+            "call_id": call_id,
+            "func_name": "forget",
+            "header": f"⚙ forget: {key}",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_forget,
+            "key": key,
+        }
+
+    def _prepare_recall(self, call_id: str, args: dict) -> dict:
+        """Prepare a recall search."""
+        query = (args.get("query") or "").strip()
+        limit = args.get("limit", 20)
+        if isinstance(limit, str):
+            try:
+                limit = int(limit)
+            except ValueError:
+                limit = 20
+        if not query:
+            return {
+                "call_id": call_id,
+                "func_name": "recall",
+                "header": "✗ recall: empty query",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: empty query",
+            }
+        return {
+            "call_id": call_id,
+            "func_name": "recall",
+            "header": f"⚙ recall: {query[:80]}",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_recall,
+            "query": query,
+            "limit": min(limit, 50),
         }
 
     # ── Execute methods (do the work, display output) ─────────────────
@@ -2448,29 +2964,45 @@ class ChatSession:
     # is the primary security boundary against prompt injection.
     _AGENT_AUTO_TOOLS = {"read_file", "search", "math", "web_fetch"}
 
-    def _run_agent(self, agent_messages: list[dict], label: str = "agent") -> str:
-        """Run an autonomous agent loop with read-only tools.
+    def _run_agent(
+        self,
+        agent_messages: list[dict],
+        label: str = "agent",
+        tools: list[dict] | None = None,
+        auto_tools: set[str] | None = None,
+        reasoning_effort: str | None = None,
+    ) -> str:
+        """Run an autonomous agent loop.
 
         Args:
             agent_messages: Pre-built message list (system + developer + user).
             label: Display prefix for progress lines ("agent" or "plan").
+            tools: Tool definitions to send to the API. Defaults to AGENT_TOOLS (read-only).
+            auto_tools: Set of tool names the agent may execute. Defaults to _AGENT_AUTO_TOOLS.
+            reasoning_effort: Override reasoning effort for this agent.
 
         Returns:
             Final content string from the agent.
         """
+        if tools is None:
+            tools = AGENT_TOOLS
+        if auto_tools is None:
+            auto_tools = self._AGENT_AUTO_TOOLS
         max_tool_turns = 20
 
-        def _api_call(messages, tools=AGENT_TOOLS):
+        kwargs = dict(self._chat_template_kwargs_base)
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+
+        def _api_call(messages, _tools=tools):
             return self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                tools=tools,
+                tools=_tools,
                 max_completion_tokens=self.max_tokens,
                 temperature=self.temperature,
                 extra_body={
-                    "chat_template_kwargs": {
-                        "reasoning_effort": self.reasoning_effort,
-                    }
+                    "chat_template_kwargs": kwargs,
                 },
             )
 
@@ -2509,18 +3041,19 @@ class ChatSession:
 
             # Execute tools sequentially (not parallel) to avoid
             # concurrent _read_files mutation from worker threads.
+            tool_names = {t["function"]["name"] for t in tools}
             for tc in assistant_msg.tool_calls:
                 tool_name = tc.function.name
 
-                # Guard: block recursive agent calls and restrict
-                # to read-only tools.
-                if tool_name in ("task", "plan", "review"):
+                # Guard 1: block recursive agent calls.
+                if tool_name in ("research", "task", "plan", "code_review"):
                     output = "Error: agents cannot spawn further agents"
-                elif tool_name not in self._AGENT_AUTO_TOOLS:
+                # Guard 2: tool not in this agent's API tool list.
+                elif tool_name not in tool_names:
                     output = (
-                        f"Error: tool '{tool_name}' requires user approval "
-                        f"and is not available in agent mode. "
-                        f"Available: {', '.join(sorted(self._AGENT_AUTO_TOOLS))}"
+                        f"Error: tool '{tool_name}' is not available in "
+                        f"agent mode. "
+                        f"Available: {', '.join(sorted(tool_names))}"
                     )
                 else:
                     tc_dict = {
@@ -2542,8 +3075,16 @@ class ChatSession:
 
                     if prepared.get("error"):
                         output = prepared["error"]
-                    elif "execute" in prepared:
+                    # Auto-execute tools in the auto_tools set.
+                    elif tool_name in auto_tools:
                         _, output = prepared["execute"](prepared)
+                    # Tools not in auto_tools require user approval.
+                    elif "execute" in prepared:
+                        self._display_and_approve([prepared])
+                        if prepared.get("denied"):
+                            output = prepared.get("denial_msg", "Denied by user")
+                        else:
+                            _, output = prepared["execute"](prepared)
                     else:
                         output = f"Unknown tool: {tool_name}"
 
@@ -2571,28 +3112,106 @@ class ChatSession:
                 ),
             }
         )
-        response = _api_call(agent_messages, tools=[])
+        response = _api_call(agent_messages, _tools=[])
         content = response.choices[0].message.content or "(no output)"
         with self._print_lock:
             sys.stdout.write(f"  {DIM}[{label} done] {len(content)} chars{RESET}\n")
             sys.stdout.flush()
         return content
 
-    def _exec_task(self, item: dict) -> tuple[str, str]:
-        """Delegate to an autonomous sub-agent."""
+    def _exec_research(self, item: dict) -> tuple[str, str]:
+        """Delegate to a read-only research sub-agent."""
         call_id, prompt = item["call_id"], item["prompt"]
-        agent_messages = list(self.system_messages) + [
-            {"role": "user", "content": prompt}
+        research_instruction = {
+            "role": "developer",
+            "content": (
+                "# Research Agent (read-only)\n\n"
+                "You are a read-only research agent. You can ONLY use search, "
+                "read_file, math, and web_fetch. You CANNOT use bash, write_file, "
+                "or edit_file.\n\n"
+                "1. **Investigate thoroughly:** Use search and read_file to gather "
+                "evidence before drawing conclusions. Do not guess — verify.\n\n"
+                "2. **Output format:**\n"
+                "   - Lead with the direct answer or finding.\n"
+                "   - Follow with supporting evidence (file paths, line numbers, "
+                "code snippets).\n"
+                "   - End with any caveats or related findings.\n\n"
+                "3. **Tool usage rules:**\n"
+                "   - Use search to locate relevant code across the codebase.\n"
+                "   - Use read_file to examine specific files in detail.\n"
+                "   - Use math for calculations and web_fetch for external data.\n"
+                "   - Do NOT use bash, write_file, or edit_file — you have no "
+                "access to these tools.\n\n"
+                "4. **Common mistakes to avoid:**\n"
+                "   - Answering without reading the relevant code first\n"
+                "   - Searching too broadly when a specific file is named\n"
+                "   - Returning vague findings without file paths or line numbers"
+            ),
+        }
+        agent_messages = list(self._agent_system_messages) + [
+            research_instruction,
+            {"role": "user", "content": prompt},
         ]
         try:
-            return call_id, self._run_agent(agent_messages, label="agent")
+            return call_id, self._run_agent(agent_messages, label="research")
         except KeyboardInterrupt:
-            return call_id, "(agent interrupted by user)"
+            return call_id, "(research interrupted by user)"
         except Exception as e:
             with self._print_lock:
-                sys.stdout.write(f"  {DIM}[agent error] {e}{RESET}\n")
+                sys.stdout.write(f"  {DIM}[research error] {e}{RESET}\n")
                 sys.stdout.flush()
-            return call_id, f"Agent error: {e}"
+            return call_id, f"Research error: {e}"
+
+    # Task agent read-only tools auto-execute without approval.
+    # bash, write_file, edit_file are in TASK_AGENT_TOOLS (the API tool list)
+    # but NOT here — they go through _display_and_approve for user approval.
+    _TASK_AUTO_TOOLS = {
+        "read_file",
+        "search",
+        "math",
+        "web_fetch",
+    }
+
+    def _exec_task(self, item: dict) -> tuple[str, str]:
+        """Delegate to a general-purpose autonomous sub-agent."""
+        call_id, prompt = item["call_id"], item["prompt"]
+        task_instruction = {
+            "role": "developer",
+            "content": (
+                "# Task Agent\n\n"
+                "You are an autonomous task agent with full tool access. "
+                "You can use bash, read_file, write_file, edit_file, search, "
+                "math, and web_fetch.\n\n"
+                "1. **Follow through on actions:** Do not describe changes — "
+                "use the tools to make them. After read_file, call edit_file "
+                "or write_file.\n\n"
+                "2. **Tool selection:**\n"
+                "   - Use read_file before edit_file on existing files.\n"
+                "   - Use write_file for new files (not bash).\n"
+                "   - Use bash for shell commands (git, python, tests).\n"
+                "   - Use search to find code across files.\n\n"
+                "3. **Complete the task fully.** Do not ask follow-up "
+                "questions — execute the work as described in the prompt."
+            ),
+        }
+        agent_messages = list(self._agent_system_messages) + [
+            task_instruction,
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            return call_id, self._run_agent(
+                agent_messages,
+                label="task",
+                tools=TASK_AGENT_TOOLS,
+                auto_tools=self._TASK_AUTO_TOOLS,
+            )
+        except KeyboardInterrupt:
+            return call_id, "(task interrupted by user)"
+        except Exception as e:
+            with self._print_lock:
+                sys.stdout.write(f"  {DIM}[task error] {e}{RESET}\n")
+                sys.stdout.flush()
+            return call_id, f"Task error: {e}"
 
     def _exec_plan(self, item: dict) -> tuple[str, str]:
         """Run a planning agent and write the result to .plan.md."""
@@ -2602,24 +3221,37 @@ class ChatSession:
         plan_instruction = {
             "role": "developer",
             "content": (
-                "You are a planning agent. Your task is to explore the codebase "
-                "and produce a structured implementation plan.\n\n"
-                "Your plan MUST include:\n"
-                "## Goal\nWhat we're building and why.\n"
-                "## Current State\nRelevant existing code and patterns found.\n"
-                "## Plan\nNumbered steps with specific files and functions to modify.\n"
-                "## Risks\nEdge cases, breaking changes, or unknowns.\n\n"
-                "Use read_file and search to understand the codebase before planning. "
-                "Be specific — reference file paths, line numbers, and function names."
+                "# Planning Agent\n\n"
+                "1. **Exploration first:** Use read_file and search to understand the "
+                "codebase before writing any plan. Do not guess at file structure or "
+                "assume patterns — verify them.\n\n"
+                "2. **Output format** — use these exact sections:\n"
+                "   - **## Goal**: What we're building and why (1-2 sentences).\n"
+                "   - **## Current State**: Relevant existing code and patterns found "
+                "during exploration. Reference specific file paths and line numbers.\n"
+                "   - **## Plan**: Numbered steps with specific files and functions "
+                "to create or modify. Each step should be actionable.\n"
+                "   - **## Risks**: Edge cases, breaking changes, or unknowns.\n\n"
+                "3. **Specificity rules:**\n"
+                "   - Reference file paths, line numbers, and function names — not vague areas.\n"
+                "   - Each plan step should name the exact file(s) and describe the change.\n"
+                "   - Identify dependencies between steps (what must happen first).\n\n"
+                "4. **Common mistakes to avoid:**\n"
+                "   - Writing a plan without reading the codebase first\n"
+                '   - Vague steps like "update the code" without naming files or functions\n'
+                "   - Ignoring existing patterns or conventions in the codebase\n"
+                "   - Planning changes to files that don't exist"
             ),
         }
-        agent_messages = list(self.system_messages) + [
+        agent_messages = list(self._agent_system_messages) + [
             plan_instruction,
             {"role": "user", "content": prompt},
         ]
 
         try:
-            content = self._run_agent(agent_messages, label="plan")
+            content = self._run_agent(
+                agent_messages, label="plan", reasoning_effort="high"
+            )
         except KeyboardInterrupt:
             return call_id, "(plan interrupted by user)"
         except Exception as e:
@@ -2644,38 +3276,176 @@ class ChatSession:
 
         return call_id, content
 
-    def _exec_review(self, item: dict) -> tuple[str, str]:
+    def _exec_code_review(self, item: dict) -> tuple[str, str]:
         """Run a code review agent and return findings as tool response."""
         call_id, prompt = item["call_id"], item["prompt"]
 
         review_instruction = {
             "role": "developer",
             "content": (
-                "You are a code review agent. Read the specified code and "
-                "produce a thorough review.\n\n"
-                "Your review MUST include:\n"
-                "## Summary\nOverall assessment (1-2 sentences).\n"
-                "## Critical Issues\nBugs, security vulnerabilities, data loss risks.\n"
-                "## Suggestions\nPerformance, readability, maintainability improvements.\n"
-                "## Positive Notes\nWell-designed patterns worth preserving.\n\n"
-                "For each issue, include the file path, line number, and a code snippet. "
-                "Prioritize correctness and security over style."
+                "# Code Review Agent\n\n"
+                "1. **Read before judging:** Use read_file to examine every file under "
+                "review. Do not comment on code you haven't read. Use search to find "
+                "related callers or dependencies when assessing impact.\n\n"
+                "2. **Output format** — use these exact sections:\n"
+                "   - **## Summary**: Overall assessment (1-2 sentences).\n"
+                "   - **## Critical Issues**: Bugs, security vulnerabilities, data loss risks. "
+                "These MUST be fixed.\n"
+                "   - **## Suggestions**: Performance, readability, maintainability improvements. "
+                "Nice to fix but not blocking.\n"
+                "   - **## Positive Notes**: Well-designed patterns worth preserving.\n\n"
+                "3. **Evidence rules:**\n"
+                "   - For each issue, include the file path, line number, and a code snippet.\n"
+                "   - Prioritize correctness and security over style.\n"
+                '   - Distinguish between "must fix" (Critical) and "should fix" (Suggestions).\n\n'
+                "4. **Common mistakes to avoid:**\n"
+                "   - Reviewing code without reading it first\n"
+                "   - Raising style nits as critical issues\n"
+                "   - Missing security vulnerabilities (injection, auth, data exposure)\n"
+                "   - Ignoring error handling and edge cases"
             ),
         }
-        agent_messages = list(self.system_messages) + [
+        agent_messages = list(self._agent_system_messages) + [
             review_instruction,
             {"role": "user", "content": prompt},
         ]
 
         try:
-            return call_id, self._run_agent(agent_messages, label="review")
+            return call_id, self._run_agent(
+                agent_messages, label="code_review", reasoning_effort="high"
+            )
         except KeyboardInterrupt:
-            return call_id, "(review interrupted by user)"
+            return call_id, "(code_review interrupted by user)"
         except Exception as e:
             with self._print_lock:
-                sys.stdout.write(f"  {DIM}[review error] {e}{RESET}\n")
+                sys.stdout.write(f"  {DIM}[code_review error] {e}{RESET}\n")
                 sys.stdout.flush()
-            return call_id, f"Review error: {e}"
+            return call_id, f"Code review error: {e}"
+
+    def _exec_remember(self, item: dict) -> tuple[str, str]:
+        """Save a persistent memory."""
+        call_id, key, value = item["call_id"], item["key"], item["value"]
+        try:
+            conn = _open_db()
+            try:
+                existing = conn.execute(
+                    "SELECT value FROM memories WHERE key = ?", (key,)
+                ).fetchone()
+                conn.execute(
+                    "INSERT OR REPLACE INTO memories (key, value, created, updated) "
+                    "VALUES (?, ?, COALESCE("
+                    "  (SELECT created FROM memories WHERE key = ?), "
+                    "  datetime('now')"
+                    "), datetime('now'))",
+                    (key, value, key),
+                )
+                conn.commit()
+                self._init_system_messages()
+                if existing:
+                    msg = f"Updated memory: {key} = {value} (was: {existing[0]})"
+                else:
+                    msg = f"Saved memory: {key} = {value}"
+                with self._print_lock:
+                    sys.stdout.write(f"    {DIM}{msg}{RESET}\n")
+                    sys.stdout.flush()
+                return call_id, msg
+            finally:
+                conn.close()
+        except Exception as e:
+            return call_id, f"Error: {e}"
+
+    def _exec_remember_list(self, item: dict) -> tuple[str, str]:
+        """List all persistent memories."""
+        call_id = item["call_id"]
+        try:
+            conn = _open_db()
+            try:
+                rows = conn.execute(
+                    "SELECT key, value FROM memories ORDER BY key"
+                ).fetchall()
+                if not rows:
+                    output = "No memories stored."
+                else:
+                    output = "\n".join(f"{k}={v}" for k, v in rows)
+                with self._print_lock:
+                    sys.stdout.write(f"    {DIM}{output}{RESET}\n")
+                    sys.stdout.flush()
+                return call_id, output
+            finally:
+                conn.close()
+        except Exception as e:
+            return call_id, f"Error: {e}"
+
+    def _exec_remember_search(self, item: dict) -> tuple[str, str]:
+        """Search memories by keyword."""
+        call_id, query = item["call_id"], item["query"]
+        try:
+            conn = _open_db()
+            try:
+                escaped = _escape_like(query)
+                rows = conn.execute(
+                    "SELECT key, value FROM memories "
+                    "WHERE key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\' "
+                    "ORDER BY key",
+                    (f"%{escaped}%", f"%{escaped}%"),
+                ).fetchall()
+                if not rows:
+                    output = f"No memories matching '{query}'."
+                else:
+                    output = "\n".join(f"{k}={v}" for k, v in rows)
+                with self._print_lock:
+                    sys.stdout.write(f"    {DIM}{output}{RESET}\n")
+                    sys.stdout.flush()
+                return call_id, output
+            finally:
+                conn.close()
+        except Exception as e:
+            return call_id, f"Error: {e}"
+
+    def _exec_forget(self, item: dict) -> tuple[str, str]:
+        """Remove a persistent memory by key."""
+        call_id, key = item["call_id"], item["key"]
+        try:
+            conn = _open_db()
+            try:
+                cursor = conn.execute("DELETE FROM memories WHERE key = ?", (key,))
+                conn.commit()
+                if cursor.rowcount == 0:
+                    msg = f"Error: memory '{key}' not found"
+                else:
+                    self._init_system_messages()
+                    msg = f"Forgot: {key}"
+                with self._print_lock:
+                    sys.stdout.write(f"    {DIM}{msg}{RESET}\n")
+                    sys.stdout.flush()
+                return call_id, msg
+            finally:
+                conn.close()
+        except Exception as e:
+            return call_id, f"Error: {e}"
+
+    def _exec_recall(self, item: dict) -> tuple[str, str]:
+        """Search past conversation history."""
+        call_id = item["call_id"]
+        query, limit = item["query"], item["limit"]
+        rows = _search_history(query, limit)
+        if not rows:
+            output = f"No past conversations matching '{query}'."
+        else:
+            lines = []
+            for ts, sid, role, content, tool_name in rows:
+                label = role
+                if tool_name:
+                    label = f"{role}({tool_name})"
+                text = (content or "")[:500]
+                if content and len(content) > 500:
+                    text += "..."
+                lines.append(f"[{ts} session {sid}] {label}: {text}")
+            output = f"Found {len(rows)} results:\n" + "\n".join(lines)
+        with self._print_lock:
+            sys.stdout.write(f"    {DIM}{output}{RESET}\n")
+            sys.stdout.flush()
+        return call_id, output
 
     def _exec_write_file(self, item: dict) -> tuple[str, str]:
         """Write content to a file, creating parent directories as needed."""
@@ -2691,28 +3461,40 @@ class ChatSession:
             return call_id, f"Error writing {path}: {e}"
 
     def _exec_edit_file(self, item: dict) -> tuple[str, str]:
-        """Replace an exact unique string in a file (re-reads to avoid TOCTOU)."""
+        """Replace an exact string in a file (re-reads to avoid TOCTOU).
+
+        When near_line is set, picks the occurrence nearest that line
+        instead of requiring uniqueness.
+        """
         call_id = item["call_id"]
         path, old_string, new_string = (
             item["path"],
             item["old_string"],
             item["new_string"],
         )
+        near_line = item.get("near_line")
         try:
             with open(path, "r") as f:
                 content = f.read()
-            count = content.count(old_string)
-            if count == 0:
+            occurrences = _find_occurrences(content, old_string)
+            if len(occurrences) == 0:
                 return (
                     call_id,
                     f"Error: old_string no longer found in {path} (file changed)",
                 )
-            if count > 1:
+            if len(occurrences) > 1 and near_line is None:
+                line_list = ", ".join(str(ln) for ln in occurrences)
                 return (
                     call_id,
-                    f"Error: old_string now found {count} times (file changed)",
+                    f"Error: old_string found {len(occurrences)} times "
+                    f"at lines {line_list} (file changed)",
                 )
-            content = content.replace(old_string, new_string, 1)
+            if near_line is not None and len(occurrences) > 1:
+                # Replace only the occurrence nearest to near_line
+                idx = _pick_nearest(content, old_string, near_line)
+                content = content[:idx] + new_string + content[idx + len(old_string) :]
+            else:
+                content = content.replace(old_string, new_string, 1)
             with open(path, "w") as f:
                 f.write(content)
             return call_id, f"Edited {path}: replaced 1 occurrence"
@@ -2747,38 +3529,21 @@ class ChatSession:
         return call_id, output if output else "(no output)"
 
     def _exec_web_fetch(self, item: dict) -> tuple[str, str]:
-        """Fetch a URL and return its content as text."""
+        """Fetch a URL, then summarize/extract using an API call."""
         call_id, url = item["call_id"], item["url"]
+        question = item.get("question", "Summarize the key content of this page.")
+
+        # Phase 1: fetch the URL
         try:
             req = Request(url, headers={"User-Agent": "chat.py/1.0"})
             with urlopen(req, timeout=self.tool_timeout) as resp:
-                # Decode using charset from Content-Type, default utf-8
                 ct = resp.headers.get_content_type() or ""
                 charset = resp.headers.get_content_charset() or "utf-8"
-                raw = resp.read()
+                raw = resp.read(10 * 1024 * 1024)  # 10 MB cap
                 text = raw.decode(charset, errors="replace")
 
             if "html" in ct:
                 text = _strip_html(text)
-
-            original_len = len(text)
-            if original_len > 10_000:
-                text = (
-                    text[:5_000]
-                    + f"\n\n... [{original_len - 10_000} chars truncated] ...\n\n"
-                    + text[-5_000:]
-                )
-
-            with self._print_lock:
-                preview = text[:500]
-                if original_len > 500:
-                    preview += f"\n  ... ({original_len} chars total)"
-                if preview:
-                    indented = textwrap.indent(preview, "    ")
-                    sys.stdout.write(f"{DIM}{indented}{RESET}\n")
-                    sys.stdout.flush()
-
-            return call_id, text if text else "(empty response)"
 
         except (URLError, TimeoutError) as e:
             msg = f"Fetch failed: {e}"
@@ -2798,6 +3563,68 @@ class ChatSession:
                 sys.stdout.write(f"    {red(msg)}\n")
                 sys.stdout.flush()
             return call_id, msg
+
+        if not text.strip():
+            return call_id, "(empty response from URL)"
+
+        original_len = len(text)
+        with self._print_lock:
+            sys.stdout.write(
+                f"    {DIM}fetched {original_len} chars, extracting...{RESET}\n"
+            )
+            sys.stdout.flush()
+
+        # Phase 2: truncate for summarization context
+        max_content = 50_000
+        if len(text) > max_content:
+            text = (
+                text[: max_content // 2]
+                + f"\n\n... [{len(text) - max_content} chars omitted] ...\n\n"
+                + text[-(max_content // 2) :]
+            )
+
+        # Phase 3: summarization API call
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a web content extraction assistant. "
+                            "Answer the user's question using ONLY the "
+                            "provided page content. Be concise and factual. "
+                            "If the content doesn't contain the answer, say so."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Page URL: {url}\n"
+                            f"Page content ({original_len} chars):\n\n"
+                            f"{text}\n\n---\n"
+                            f"Question: {question}"
+                        ),
+                    },
+                ],
+                max_completion_tokens=2000,
+                temperature=0.2,
+            )
+            answer = response.choices[0].message.content or "(no answer)"
+        except Exception as e:
+            answer = (
+                f"Extraction failed (page was fetched but summarization errored): {e}"
+            )
+
+        with self._print_lock:
+            preview = answer[:300]
+            if len(answer) > 300:
+                preview += "..."
+            indented = textwrap.indent(preview, "    ")
+            sys.stdout.write(f"{DIM}{indented}{RESET}\n")
+            sys.stdout.flush()
+
+        return call_id, answer
 
     def handle_command(self, cmd_line: str) -> bool:
         """Handle slash commands. Returns True if should exit."""
@@ -2837,33 +3664,41 @@ class ChatSession:
             self._last_usage = None
             self._msg_tokens = []
             self._chars_per_token = 4.0
+            try:
+                db = _open_db()
+                db.execute(
+                    "DELETE FROM conversations WHERE session_id = ?",
+                    (self._session_id,),
+                )
+                db.commit()
+                db.close()
+            except Exception:
+                pass
             print("History cleared.")
 
         elif cmd == "/history":
-            n_msgs = len(self.messages)
-            if self._last_usage:
-                total_tok = (
-                    self._last_usage["prompt_tokens"]
-                    + self._last_usage["completion_tokens"]
-                )
-                print(
-                    f"Messages: {n_msgs} | "
-                    f"Tokens: {total_tok:,} / {self.context_window:,} | "
-                    f"System msgs: {len(self.system_messages)}"
-                )
+            query = arg.strip() if arg else None
+            if query:
+                rows = _search_history(query, limit=20)
+                if not rows:
+                    print(f"No results for {query!r}")
+                else:
+                    print(f"Found {len(rows)} result(s) for {query!r}:\n")
+                    for ts, sid, role, content, tool_name in rows:
+                        label = tool_name if tool_name else role
+                        text = (content or "")[:200]
+                        print(f"  {dim(ts)} {dim(sid)} {bold(label)}: {text}")
             else:
-                total_chars = 0
-                for m in self._full_messages():
-                    total_chars += len(m.get("content") or "")
-                    for tc in m.get("tool_calls", []):
-                        total_chars += len(tc.get("function", {}).get("name", ""))
-                        total_chars += len(tc.get("function", {}).get("arguments", ""))
-                est_tokens = total_chars // 4
-                print(
-                    f"Messages: {n_msgs} | "
-                    f"Est. tokens: ~{est_tokens:,} | "
-                    f"System msgs: {len(self.system_messages)}"
-                )
+                # Show recent conversations (last 20 messages)
+                rows = _search_history_recent(limit=20)
+                if not rows:
+                    print("No conversation history yet.")
+                else:
+                    print("Recent history:\n")
+                    for ts, sid, role, content, tool_name in rows:
+                        label = tool_name if tool_name else role
+                        text = (content or "")[:200]
+                        print(f"  {dim(ts)} {dim(sid)} {bold(label)}: {text}")
 
         elif cmd == "/model":
             print(f"Model: {cyan(self.model)}")
@@ -2923,7 +3758,7 @@ class ChatSession:
   /persona <name>       Set persona (system message)
   /instructions <text>  Set developer instructions
   /clear, /new          Clear conversation history
-  /history              Show message count & token usage
+  /history [query]      Search conversation history (or show recent)
   /model                Show current model
   /raw                  Toggle reasoning content display
   /reason [low|med|high] Set/show reasoning effort
@@ -3094,7 +3929,6 @@ def main():
             except Exception as e:
                 print(f"\n{red(f'Error: {e}')}")
 
-    # atexit handles readline save
     print("Goodbye.")
 
 

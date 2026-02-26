@@ -1,0 +1,1127 @@
+#!/usr/bin/env python3
+"""eval.py — Prompt optimization and evaluation for pcode.
+
+Iteratively evaluates and optimizes the pcode developer prompt by running
+test cases, scoring tool call sequences against expected actions, and using
+the model to self-modify the prompt based on results.
+
+Usage:
+    python -m pcode.eval tests.json
+    python -m pcode.eval tests.json --no-optimize
+    python -m pcode.eval tests.json --prompt prompt.txt --n-runs 5 --max-iter 10
+"""
+
+import argparse
+import contextlib
+import difflib
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import textwrap
+import time
+from datetime import datetime
+
+from openai import OpenAI
+
+import pcode.chat as _chat_module
+from pcode.chat import TOOLS, ChatSession
+
+
+# ─── ANSI & logging helpers ───────────────────────────────────────────────────
+
+DIM = "\033[2m"
+RESET = "\033[0m"
+GREEN = "\033[32m"
+RED = "\033[31m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+BOLD = "\033[1m"
+
+
+def _log(msg: str, dim: bool = False):
+    """Print a log line with optional dim styling."""
+    if dim:
+        sys.stderr.write(f"{DIM}{msg}{RESET}\n")
+    else:
+        sys.stderr.write(f"{msg}\n")
+    sys.stderr.flush()
+
+
+def _fmt_args(args: dict, max_len: int = 80) -> str:
+    """Format tool args as a compact one-line summary."""
+    parts = []
+    for k, v in args.items():
+        sv = str(v)
+        if len(sv) > 40:
+            sv = sv[:37] + "..."
+        parts.append(f"{k}={sv!r}")
+    out = ", ".join(parts)
+    if len(out) > max_len:
+        out = out[: max_len - 3] + "..."
+    return out
+
+
+# ─── Stdout suppression ──────────────────────────────────────────────────────
+
+
+@contextlib.contextmanager
+def _suppress_stdout():
+    """Redirect stdout to devnull temporarily."""
+    old = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        yield
+    finally:
+        sys.stdout = old
+
+
+# ─── Headless session ────────────────────────────────────────────────────────
+
+
+class HeadlessSession(ChatSession):
+    """ChatSession subclass for headless evaluation.
+
+    Differences from ChatSession:
+    - auto_approve is always True
+    - Tool calls are recorded into a structured log
+    - All stdout output is suppressed
+    - send_headless() uses non-streaming API
+    """
+
+    def __init__(self, client, model, system_prompt_override=None, **kwargs):
+        super().__init__(client=client, model=model, **kwargs)
+        self.tool_call_log: list[dict] = []
+        self.auto_approve = True
+        if system_prompt_override is not None:
+            self._override_system_prompt(system_prompt_override)
+
+    def _override_system_prompt(self, content: str):
+        """Replace the developer message content with a custom prompt."""
+        for i, msg in enumerate(self.system_messages):
+            if msg["role"] == "developer":
+                self.system_messages[i] = {"role": "developer", "content": content}
+                return
+        self.system_messages.append({"role": "developer", "content": content})
+
+    def _display_and_approve(self, items: list[dict]) -> str | None:
+        """Skip all display and approval — auto-approve everything."""
+        return None
+
+    def send_headless(
+        self,
+        user_input: str,
+        max_turns: int = 10,
+        verbose: bool = False,
+        log_prefix: str = "",
+    ) -> list[dict]:
+        """Run a complete conversation turn headlessly.
+
+        Uses non-streaming API calls. Captures all tool calls into
+        self.tool_call_log.
+
+        Returns the tool call log: list of dicts with keys:
+            tool: str, args: dict, result: str (truncated), turn: int
+        """
+        self.tool_call_log = []
+        self.messages.append({"role": "user", "content": user_input})
+        self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
+
+        for turn in range(max_turns):
+            if verbose:
+                _log(f"{log_prefix}  turn {turn}: calling API...", dim=True)
+
+            t0 = time.monotonic()
+            msgs = self._full_messages()
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=msgs,
+                tools=TOOLS,
+                max_completion_tokens=self.max_tokens,
+                temperature=self.temperature,
+                stream=False,
+                extra_body={
+                    "chat_template_kwargs": {
+                        "reasoning_effort": self.reasoning_effort,
+                    }
+                },
+            )
+            elapsed = time.monotonic() - t0
+
+            choice = response.choices[0]
+            assistant_msg: dict = {
+                "role": "assistant",
+                "content": choice.message.content or None,
+            }
+
+            if choice.message.tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in choice.message.tool_calls
+                ]
+
+            self.messages.append(assistant_msg)
+            msg_len = len(assistant_msg.get("content") or "")
+            self._msg_tokens.append(max(1, int(msg_len / self._chars_per_token)))
+
+            # Log usage and content
+            usage = getattr(response, "usage", None)
+            if verbose:
+                toks = ""
+                if usage:
+                    toks = f"  [{usage.prompt_tokens}p/{usage.completion_tokens}c tok]"
+                _log(
+                    f"{log_prefix}  turn {turn}: response in {elapsed:.1f}s{toks}",
+                    dim=True,
+                )
+                if assistant_msg["content"]:
+                    text = assistant_msg["content"][:200]
+                    if len(assistant_msg["content"]) > 200:
+                        text += "..."
+                    _log(f"{log_prefix}    content: {text}", dim=True)
+
+            if not choice.message.tool_calls:
+                if verbose:
+                    _log(f"{log_prefix}  turn {turn}: no tool calls, done", dim=True)
+                break
+
+            # Log tool calls
+            if verbose:
+                names = [tc.function.name for tc in choice.message.tool_calls]
+                _log(f"{log_prefix}  turn {turn}: tools -> {names}")
+
+            # Execute tools with stdout suppressed
+            with _suppress_stdout():
+                results, _ = self._execute_tools(assistant_msg["tool_calls"])
+
+            for tc, (tc_id, output) in zip(assistant_msg["tool_calls"], results):
+                func_name = tc["function"]["name"]
+                try:
+                    args = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError:
+                    args = {"_raw": tc["function"]["arguments"]}
+
+                self.tool_call_log.append(
+                    {
+                        "tool": func_name,
+                        "args": args,
+                        "result": output[:500],
+                        "turn": turn,
+                    }
+                )
+
+                if verbose:
+                    # Show compact args summary
+                    arg_summary = _fmt_args(args)
+                    result_preview = output[:120].replace("\n", "\\n")
+                    if len(output) > 120:
+                        result_preview += "..."
+                    _log(f"{log_prefix}    {func_name}({arg_summary})", dim=False)
+                    _log(f"{log_prefix}      -> {result_preview}", dim=True)
+
+                tool_msg = {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": output,
+                }
+                self.messages.append(tool_msg)
+                self._msg_tokens.append(
+                    max(1, int(len(output) / self._chars_per_token))
+                )
+
+        return self.tool_call_log
+
+
+# ─── Test runner ─────────────────────────────────────────────────────────────
+
+
+def _run_single_test(
+    client: OpenAI,
+    model: str,
+    system_prompt: str,
+    case: dict,
+    temperature: float,
+    max_tokens: int,
+    reasoning_effort: str,
+    context_window: int,
+    verbose: bool = False,
+    log_prefix: str = "",
+) -> dict:
+    """Run a single test case once in an isolated temp directory.
+
+    Must be called serially — uses os.chdir which is process-global.
+
+    Returns dict with keys: tool_log, final_content, message_count, elapsed.
+    """
+    workdir = tempfile.mkdtemp(prefix="pcode_eval_")
+    original_cwd = os.getcwd()
+    eval_db = os.path.join(workdir, ".pcode_eval.db")
+    _chat_module._db_override = eval_db
+    t0 = time.monotonic()
+
+    try:
+        # Write setup files
+        setup_files = list(case.get("setup", {}).get("files", {}).items())
+        for path, content in setup_files:
+            full = os.path.join(workdir, path)
+            os.makedirs(os.path.dirname(full) or workdir, exist_ok=True)
+            with open(full, "w") as f:
+                f.write(content)
+
+        if verbose and setup_files:
+            _log(
+                f"{log_prefix}  setup: created {[p for p, _ in setup_files]}", dim=True
+            )
+
+        os.chdir(workdir)
+
+        session = HeadlessSession(
+            client=client,
+            model=model,
+            system_prompt_override=system_prompt,
+            persona=None,
+            instructions=None,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tool_timeout=30,
+            reasoning_effort=reasoning_effort,
+            context_window=context_window,
+        )
+
+        max_turns = case.get("max_turns", 10)
+        tool_log = session.send_headless(
+            case["user_prompt"],
+            max_turns=max_turns,
+            verbose=verbose,
+            log_prefix=log_prefix,
+        )
+
+        final_content = ""
+        for msg in reversed(session.messages):
+            if msg["role"] == "assistant" and msg.get("content"):
+                final_content = msg["content"]
+                break
+
+        elapsed = time.monotonic() - t0
+        return {
+            "tool_log": tool_log,
+            "final_content": final_content,
+            "message_count": len(session.messages),
+            "elapsed": round(elapsed, 1),
+        }
+    finally:
+        _chat_module._db_override = None
+        _chat_module._db_initialized.discard(eval_db)
+        os.chdir(original_cwd)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ─── Scoring ─────────────────────────────────────────────────────────────────
+
+
+def _match_action(actual: dict, expected: dict) -> bool:
+    """Check if a single actual tool call matches an expected action spec."""
+    if actual["tool"] != expected["tool"]:
+        return False
+
+    actual_args = actual["args"]
+
+    # If args were unparseable (_raw fallback), can only match on tool name
+    if "_raw" in actual_args and len(actual_args) == 1:
+        return "args" not in expected and "args_pattern" not in expected
+
+    # Check exact args (partial key matching)
+    if "args" in expected:
+        for key, expected_val in expected["args"].items():
+            actual_val = actual_args.get(key)
+            if actual_val is None:
+                return False
+            if str(actual_val) != str(expected_val):
+                return False
+
+    # Check regex args_pattern
+    if "args_pattern" in expected:
+        for key, pattern in expected["args_pattern"].items():
+            actual_val = str(actual_args.get(key, ""))
+            if not re.search(pattern, actual_val):
+                return False
+
+    return True
+
+
+def score_run(
+    tool_log: list[dict],
+    expected_actions: list[dict],
+    match_mode: str = "ordered_subset",
+) -> dict:
+    """Score a single run's tool log against expected actions.
+
+    Returns dict with: pass, score, matched, unmatched, extra_tools, detail.
+    """
+    if not expected_actions:
+        return {
+            "pass": True,
+            "score": 1.0,
+            "matched": [],
+            "unmatched": [],
+            "extra_tools": [],
+            "detail": "No expected actions defined",
+        }
+
+    n_expected = len(expected_actions)
+
+    if match_mode == "exact":
+        matched = []
+        for i, (actual, expected) in enumerate(zip(tool_log, expected_actions)):
+            if _match_action(actual, expected):
+                matched.append(i)
+        score = len(matched) / n_expected
+        length_ok = len(tool_log) == n_expected
+        detail = f"Exact: {len(matched)}/{n_expected} matched"
+        if not length_ok:
+            detail += f" (length {len(tool_log)} vs {n_expected})"
+        return {
+            "pass": length_ok and len(matched) == n_expected,
+            "score": score,
+            "matched": matched,
+            "unmatched": [i for i in range(n_expected) if i not in matched],
+            "extra_tools": [t["tool"] for t in tool_log[n_expected:]],
+            "detail": detail,
+        }
+
+    elif match_mode == "ordered_subset":
+        matched = []
+        search_from = 0
+        for ei, expected in enumerate(expected_actions):
+            for ai in range(search_from, len(tool_log)):
+                if _match_action(tool_log[ai], expected):
+                    matched.append(ei)
+                    search_from = ai + 1
+                    break
+        score = len(matched) / n_expected
+        unmatched = [i for i in range(n_expected) if i not in matched]
+        return {
+            "pass": len(matched) == n_expected,
+            "score": score,
+            "matched": matched,
+            "unmatched": unmatched,
+            "extra_tools": [],
+            "detail": f"Ordered subset: {len(matched)}/{n_expected}",
+        }
+
+    elif match_mode == "subset":
+        matched = []
+        used = set()
+        for ei, expected in enumerate(expected_actions):
+            for ai, actual in enumerate(tool_log):
+                if ai not in used and _match_action(actual, expected):
+                    matched.append(ei)
+                    used.add(ai)
+                    break
+        score = len(matched) / n_expected
+        unmatched = [i for i in range(n_expected) if i not in matched]
+        return {
+            "pass": len(matched) == n_expected,
+            "score": score,
+            "matched": matched,
+            "unmatched": unmatched,
+            "extra_tools": [],
+            "detail": f"Subset: {len(matched)}/{n_expected}",
+        }
+
+    elif match_mode == "contains_any":
+        for ei, expected in enumerate(expected_actions):
+            for actual in tool_log:
+                if _match_action(actual, expected):
+                    return {
+                        "pass": True,
+                        "score": 1.0,
+                        "matched": [ei],
+                        "unmatched": [],
+                        "extra_tools": [],
+                        "detail": "Contains at least one match",
+                    }
+        return {
+            "pass": False,
+            "score": 0.0,
+            "matched": [],
+            "unmatched": list(range(n_expected)),
+            "extra_tools": [t["tool"] for t in tool_log],
+            "detail": "None of the expected actions were found",
+        }
+
+    else:
+        return {
+            "pass": False,
+            "score": 0.0,
+            "matched": [],
+            "unmatched": list(range(n_expected)),
+            "extra_tools": [],
+            "detail": f"Unknown match_mode: {match_mode}",
+        }
+
+
+# ─── Iteration runner ────────────────────────────────────────────────────────
+
+
+def _run_iteration(
+    client: OpenAI,
+    model: str,
+    system_prompt: str,
+    cases: list[dict],
+    n_runs: int,
+    temperature: float,
+    max_tokens: int,
+    reasoning_effort: str,
+    context_window: int,
+    verbose: bool = False,
+) -> dict:
+    """Run all test cases n_runs times and score them."""
+    case_results = {}
+
+    for ci, case in enumerate(cases):
+        case_id = case["id"]
+        case_n = case.get("n_runs", n_runs)
+        runs = []
+
+        print(
+            f"\n  {CYAN}[{ci + 1}/{len(cases)}]{RESET} {BOLD}{case_id}{RESET} ({case_n} runs)"
+        )
+        if verbose:
+            _log(f"    prompt: {case['user_prompt']}", dim=True)
+
+        for run_idx in range(case_n):
+            log_prefix = f"      [{run_idx + 1}/{case_n}]"
+
+            try:
+                run_result = _run_single_test(
+                    client=client,
+                    model=model,
+                    system_prompt=system_prompt,
+                    case=case,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    context_window=context_window,
+                    verbose=verbose,
+                    log_prefix=log_prefix,
+                )
+
+                score_result = score_run(
+                    tool_log=run_result["tool_log"],
+                    expected_actions=case.get("expected_actions", []),
+                    match_mode=case.get("match_mode", "ordered_subset"),
+                )
+
+                score_result["tool_sequence"] = [
+                    t["tool"] for t in run_result["tool_log"]
+                ]
+                score_result["tool_args"] = [
+                    {t["tool"]: t["args"]} for t in run_result["tool_log"]
+                ]
+                score_result["elapsed"] = run_result.get("elapsed", 0)
+
+            except Exception as e:
+                score_result = {
+                    "pass": False,
+                    "score": 0.0,
+                    "matched": [],
+                    "unmatched": list(range(len(case.get("expected_actions", [])))),
+                    "extra_tools": [],
+                    "detail": f"Error: {e}",
+                    "tool_sequence": [],
+                    "elapsed": 0,
+                }
+
+            passed = score_result["pass"]
+            status_color = GREEN if passed else RED
+            status_label = "PASS" if passed else "FAIL"
+            tools = score_result.get("tool_sequence", [])
+            elapsed = score_result.get("elapsed", 0)
+            print(
+                f"    Run {run_idx + 1}: "
+                f"{status_color}[{status_label}]{RESET} "
+                f"score={score_result['score']:.2f} "
+                f"tools={tools}"
+                f"  {DIM}({elapsed:.1f}s){RESET}"
+            )
+
+            runs.append(score_result)
+
+        pass_count = sum(1 for r in runs if r["pass"])
+        case_results[case_id] = {
+            "runs": runs,
+            "pass_rate": pass_count / len(runs) if runs else 0,
+            "avg_score": (sum(r["score"] for r in runs) / len(runs) if runs else 0),
+        }
+
+    # Aggregate
+    total_runs = sum(len(cr["runs"]) for cr in case_results.values())
+    total_passes = sum(
+        sum(1 for r in cr["runs"] if r["pass"]) for cr in case_results.values()
+    )
+
+    return {
+        "cases": case_results,
+        "aggregate": {
+            "total_cases": len(cases),
+            "total_runs": total_runs,
+            "overall_pass_rate": total_passes / total_runs if total_runs else 0,
+            "overall_avg_score": (
+                sum(cr["avg_score"] for cr in case_results.values()) / len(case_results)
+                if case_results
+                else 0
+            ),
+            "per_case_pass_rates": {
+                cid: cr["pass_rate"] for cid, cr in case_results.items()
+            },
+        },
+    }
+
+
+# ─── Prompt optimizer ────────────────────────────────────────────────────────
+
+
+OPTIMIZER_SYSTEM = """\
+You are a prompt engineer optimizing a developer message for an AI coding assistant.
+
+The chat template automatically builds the system message (persona, knowledge \
+cutoff, date, reasoning effort, channel declarations, tool schemas). You are \
+optimizing only the developer message, which the template wraps with \
+"# Instructions\\n\\n" and appends tool definitions after.
+
+You will see test results showing which cases pass and fail. Study the \
+failure patterns carefully — the most common failure is the model returning \
+NO tool calls at all (tools=[]). Your prompt must make tool usage feel like \
+the natural default, not an option.
+
+Style constraint: the model follows natural prose better than structured \
+rules. Avoid bullet points, numbered lists, and formal rule language. Write \
+in flowing sentences — 2-3 short paragraphs is ideal.
+
+Length target: aim for 600-1200 chars. Brevity helps, but not at the cost \
+of missing critical behavioral guidance. If a specific instruction would \
+fix a failing test case, include it even if it adds length.
+
+Be bold — if the current prompt is failing on specific cases, make targeted \
+changes to address them. You can restructure, reword, or add new guidance. \
+Don't just tweak punctuation. But preserve patterns that are already working \
+(look at which cases score 100%).
+
+Output ONLY the new developer message — no commentary, no explanation, \
+no markdown fences, no meta-commentary about your changes.\
+"""
+
+
+OBSERVER_SYSTEM = """\
+You are a meta-optimizer tuning a prompt engineer's developer prompt.
+
+You receive the engineer's current developer prompt and iteration history \
+showing score changes, prompt diffs, and per-case regressions.
+
+Your job: edit the developer prompt so the engineer produces better results. \
+Look at what changed between iterations and what happened to scores.
+
+Here's what good optimizer edits look like — scores went up after these:
+- Replacing "Always read files before editing" with "Study the failure \
+patterns — when tools=[] appears, the prompt needs to make tool calls \
+feel inevitable, not optional"
+- Removing a bullet list and rewriting as a flowing paragraph
+- Adding "Be bold — restructure if needed" when the optimizer was only \
+tweaking punctuation
+
+Here's what bad optimizer edits look like — scores dropped after these:
+- Adding 10+ "Do NOT" rules that the engineer parrots into the prompt
+- Converting prose into numbered steps or checklists
+- Growing the prompt past 1200 chars with redundant restatements
+- Adding generic advice not tied to any specific failing test case
+
+Keep your edits to 2-3 changes per cycle. Remove guidance that isn't \
+producing results. Your output must stay under 150% of the input length.
+
+Output ONLY the modified developer prompt. No commentary.\
+"""
+
+
+def _observe_and_update_optimizer(
+    client: OpenAI,
+    model: str,
+    optimizer_system: str,
+    iterations: list[dict],
+) -> str:
+    """Analyze optimizer behavior and return a modified OPTIMIZER_SYSTEM."""
+    parts = []
+    for i in range(1, len(iterations)):
+        prev, curr = iterations[i - 1], iterations[i]
+        prev_agg = prev.get("aggregate", {})
+        curr_agg = curr.get("aggregate", {})
+        prev_len = len(prev.get("prompt", ""))
+        curr_len = len(curr.get("prompt", ""))
+        len_delta = curr_len - prev_len
+        score_prev = prev_agg.get("overall_pass_rate", 0)
+        score_curr = curr_agg.get("overall_pass_rate", 0)
+        score_delta = score_curr - score_prev
+
+        part = f"Iteration {i - 1} → {i}:\n"
+        part += f"  Prompt: {len_delta:+d} chars ({prev_len} → {curr_len})\n"
+        part += f"  Score: {score_prev:.0%} → {score_curr:.0%} ({score_delta:+.0%})\n"
+
+        prev_rates = prev_agg.get("per_case_pass_rates", {})
+        curr_rates = curr_agg.get("per_case_pass_rates", {})
+        improved = []
+        regressed = []
+        for case_id in set(prev_rates) | set(curr_rates):
+            p = prev_rates.get(case_id, 0)
+            c = curr_rates.get(case_id, 0)
+            if c > p:
+                improved.append(f"{case_id} ({p:.0%}→{c:.0%})")
+            elif c < p:
+                regressed.append(f"{case_id} ({p:.0%}→{c:.0%})")
+        if improved:
+            part += f"  Improved: {', '.join(improved)}\n"
+        if regressed:
+            part += f"  Regressed: {', '.join(regressed)}\n"
+        if curr.get("prompt_diff"):
+            diff_text = curr["prompt_diff"][:500]
+            part += f"  Diff:\n{diff_text}\n"
+        parts.append(part)
+
+    user_content = (
+        f"## Current Prompt Engineer System Prompt\n```\n{optimizer_system}\n```\n\n"
+        f"## Iteration History\n" + "\n".join(parts)
+    )
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "developer", "content": OBSERVER_SYSTEM},
+            {"role": "user", "content": user_content},
+        ],
+        max_completion_tokens=2048,
+        temperature=0.3,
+        stream=False,
+    )
+
+    result = response.choices[0].message.content or optimizer_system
+    result = re.sub(
+        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
+        "",
+        result,
+        flags=re.DOTALL,
+    ).strip()
+
+    # Strip markdown code fences if wrapped
+    fence_match = re.search(r"```[^\n]*\n(.*?)```", result, re.DOTALL)
+    if fence_match:
+        result = fence_match.group(1).strip()
+
+    # Reject degenerate outputs (>150% of input length)
+    if len(result) > len(optimizer_system) * 1.5:
+        _log(
+            f"  Observer output too long ({len(result)} vs {len(optimizer_system)}), "
+            "keeping current optimizer system",
+            dim=True,
+        )
+        return optimizer_system
+
+    return result
+
+
+def _propose_prompt_modification(
+    client: OpenAI,
+    model: str,
+    current_prompt: str,
+    test_cases: list[dict],
+    iteration_result: dict,
+    history: list[dict],
+    optimizer_system: str = OPTIMIZER_SYSTEM,
+) -> str:
+    """Use the model to propose a new prompt based on evaluation results."""
+    # Build summary of results
+    summary_parts = []
+    for case_id, case_result in iteration_result["cases"].items():
+        case_def = next((c for c in test_cases if c["id"] == case_id), None)
+        if not case_def:
+            continue
+        pr = case_result["pass_rate"]
+        status = "PASS" if pr == 1.0 else "WEAK" if pr >= 0.5 else "FAIL"
+        summary_parts.append(
+            f"[{status}] {case_id} (pass_rate={case_result['pass_rate']:.0%})\n"
+            f"  User prompt: {case_def['user_prompt']}\n"
+            f"  Expected: {json.dumps(case_def['expected_actions'])}\n"
+            f"  Actual sequences: "
+            f"{[r.get('tool_sequence', []) for r in case_result['runs']]}"
+        )
+
+    # Build history summary (last 3 iterations)
+    history_parts = []
+    for h in history[-3:]:
+        agg = h.get("aggregate", {})
+        history_parts.append(
+            f"Iteration {h['iteration']}: "
+            f"overall_pass_rate={agg.get('overall_pass_rate', 0):.0%}, "
+            f"per_case={agg.get('per_case_pass_rates', {})}"
+        )
+
+    history_text = "\n".join(history_parts) if history_parts else "(first iteration)"
+
+    user_content = (
+        f"## Current Prompt\n```\n{current_prompt}\n```\n\n"
+        f"## Test Results (iteration {iteration_result.get('iteration', '?')})\n"
+        + "\n\n".join(summary_parts)
+        + f"\n\n## Score History\n{history_text}"
+        + "\n\nPropose an improved prompt. Output ONLY the new prompt text."
+    )
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "developer", "content": optimizer_system},
+            {"role": "user", "content": user_content},
+        ],
+        max_completion_tokens=16384,
+        temperature=0.6,
+        stream=False,
+    )
+
+    new_prompt = response.choices[0].message.content or current_prompt
+
+    # Strip reasoning tags if present
+    new_prompt = re.sub(
+        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
+        "",
+        new_prompt,
+        flags=re.DOTALL,
+    ).strip()
+
+    # Strip markdown code fences if the model wrapped the prompt.
+    # Also discard any explanation text outside the fences.
+    fence_match = re.search(r"```[^\n]*\n(.*?)```", new_prompt, re.DOTALL)
+    if fence_match:
+        new_prompt = fence_match.group(1).strip()
+    elif new_prompt.startswith("```"):
+        # Opening fence without closing — strip just the first line
+        new_prompt = "\n".join(new_prompt.split("\n")[1:]).strip()
+
+    return new_prompt
+
+
+def _simple_diff(old: str, new: str) -> str:
+    """Generate a simple line-level diff between two prompts."""
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    diff = difflib.unified_diff(old_lines, new_lines, fromfile="before", tofile="after")
+    return "".join(diff)
+
+
+# ─── Main optimization loop ─────────────────────────────────────────────────
+
+
+def run_optimization(
+    base_url: str,
+    model: str | None,
+    test_file: str,
+    initial_prompt: str | None = None,
+    n_runs: int = 3,
+    max_iterations: int = 5,
+    temperature: float = 0.7,
+    max_tokens: int = 32768,
+    reasoning_effort: str = "medium",
+    output_file: str = "eval_results.json",
+    context_window: int = 131072,
+    verbose: bool = False,
+):
+    """Main optimization loop."""
+    client = OpenAI(
+        base_url=base_url,
+        api_key=os.environ.get("OPENAI_API_KEY", "dummy"),
+    )
+
+    if not model:
+        model = _detect_model(client)
+
+    # Load test cases
+    with open(test_file) as f:
+        suite = json.load(f)
+
+    cases = suite["cases"]
+    for i, case in enumerate(cases):
+        if "id" not in case:
+            raise SystemExit(f"Test case {i} missing required 'id' field")
+        if "user_prompt" not in case:
+            raise SystemExit(f"Test case '{case.get('id', i)}' missing 'user_prompt'")
+    defaults = suite.get("defaults", {})
+    # Precedence: CLI arg (non-None) > tests.json defaults > code default (3)
+    if n_runs is None:
+        n_runs = defaults.get("n_runs", 3)
+
+    # Get initial prompt
+    if initial_prompt is None:
+        # Extract the default developer message from a temporary ChatSession
+        tmp = ChatSession(
+            client=client,
+            model=model,
+            persona=None,
+            instructions=None,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tool_timeout=30,
+            reasoning_effort=reasoning_effort,
+            context_window=context_window,
+        )
+        initial_prompt = next(
+            m["content"] for m in tmp.system_messages if m["role"] == "developer"
+        )
+
+    current_prompt = initial_prompt
+    results = {
+        "meta": {
+            "model": model,
+            "base_url": base_url,
+            "started": datetime.now().isoformat(),
+            "test_suite": test_file,
+            "n_runs_default": n_runs,
+        },
+        "iterations": [],
+    }
+
+    current_optimizer_system = OPTIMIZER_SYSTEM
+
+    for iteration in range(max_iterations):
+        print(f"\n{'=' * 60}")
+        print(f"Iteration {iteration}")
+        print(f"{'=' * 60}")
+
+        iter_result = _run_iteration(
+            client=client,
+            model=model,
+            system_prompt=current_prompt,
+            cases=cases,
+            n_runs=n_runs,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            context_window=context_window,
+            verbose=verbose,
+        )
+        iter_result["iteration"] = iteration
+        iter_result["prompt"] = current_prompt
+        iter_result["prompt_diff"] = None
+        iter_result["timestamp"] = datetime.now().isoformat()
+
+        results["iterations"].append(iter_result)
+
+        # Write intermediate results
+        with open(output_file, "w") as f:
+            json.dump(results, f, indent=2)
+
+        # Print summary
+        agg = iter_result["aggregate"]
+        print(f"\nOverall pass rate: {agg['overall_pass_rate']:.0%}")
+        print(f"Overall avg score: {agg['overall_avg_score']:.2f}")
+        for case_id, rate in agg["per_case_pass_rates"].items():
+            status = "PASS" if rate == 1.0 else "FAIL"
+            print(f"  [{status}] {case_id}: {rate:.0%}")
+
+        # Check if all passing
+        if agg["overall_pass_rate"] == 1.0:
+            print("\nAll test cases passing! Stopping.")
+            break
+
+        # Propose new prompt (skip on last iteration)
+        if iteration < max_iterations - 1:
+            # Observer: update optimizer developer prompt every 3 iterations
+            if iteration >= 2 and iteration % 3 == 2:
+                _log("  Observer updating optimizer prompt...", dim=True)
+                try:
+                    new_opt = _observe_and_update_optimizer(
+                        client,
+                        model,
+                        current_optimizer_system,
+                        results["iterations"],
+                    )
+                    if new_opt != current_optimizer_system:
+                        opt_diff = _simple_diff(current_optimizer_system, new_opt)
+                        _log(f"  Observer diff:\n{opt_diff}", dim=True)
+                        current_optimizer_system = new_opt
+                    else:
+                        _log("  Observer: no changes", dim=True)
+                except Exception as e:
+                    _log(f"  Observer error: {e}", dim=True)
+
+            print("\nOptimizing prompt...")
+            new_prompt = _propose_prompt_modification(
+                client=client,
+                model=model,
+                current_prompt=current_prompt,
+                test_cases=cases,
+                iteration_result=iter_result,
+                history=results["iterations"],
+                optimizer_system=current_optimizer_system,
+            )
+
+            if new_prompt != current_prompt:
+                diff = _simple_diff(current_prompt, new_prompt)
+                print(
+                    f"Prompt modified "
+                    f"({len(current_prompt)} -> {len(new_prompt)} chars)"
+                )
+                if diff:
+                    print(diff)
+                iter_result["prompt_diff"] = diff
+                # Re-write with the diff included
+                with open(output_file, "w") as f:
+                    json.dump(results, f, indent=2)
+                current_prompt = new_prompt
+            else:
+                print("Optimizer returned identical prompt. Stopping.")
+                break
+
+    print(f"\nResults written to {output_file}")
+    return results
+
+
+def _detect_model(client: OpenAI) -> str:
+    """Auto-detect the model from the API."""
+    try:
+        models = client.models.list()
+        model_ids = [m.id for m in models.data]
+        if model_ids:
+            return model_ids[0]
+    except Exception:
+        pass
+    raise SystemExit("Could not auto-detect model. Use --model to specify.")
+
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Prompt optimization and evaluation for pcode",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              # Run evaluation with default prompt
+              pcode-eval tests.json
+
+              # Run with custom initial prompt from file
+              pcode-eval tests.json --prompt prompt.txt
+
+              # Single evaluation pass (no optimization)
+              pcode-eval tests.json --no-optimize
+
+              # Configure runs and iterations
+              pcode-eval tests.json --n-runs 5 --max-iter 10
+        """),
+    )
+    parser.add_argument(
+        "test_file",
+        help="Path to test cases JSON file",
+    )
+    parser.add_argument(
+        "--base-url",
+        default="http://localhost:8000/v1",
+        help="API base URL (default: http://localhost:8000/v1)",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Model name (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Path to initial prompt text file (default: use pcode's built-in)",
+    )
+    parser.add_argument(
+        "--n-runs",
+        type=int,
+        default=None,
+        help="Number of runs per test case (default: from tests.json or 3)",
+    )
+    parser.add_argument(
+        "--max-iter",
+        type=int,
+        default=5,
+        help="Maximum optimization iterations (default: 5)",
+    )
+    parser.add_argument(
+        "--no-optimize",
+        action="store_true",
+        help="Run evaluation only, no prompt optimization",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature (default: 0.7)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=32768,
+        help="Max completion tokens (default: 32768)",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        default="medium",
+        choices=["low", "medium", "high"],
+        help="Reasoning effort (default: medium)",
+    )
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=131072,
+        help="Context window size (default: 131072)",
+    )
+    parser.add_argument(
+        "--output",
+        default="eval_results.json",
+        help="Output results file (default: eval_results.json)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show detailed per-turn logging (API calls, tool args, results)",
+    )
+    args = parser.parse_args()
+
+    # Load initial prompt if provided
+    initial_prompt = None
+    if args.prompt:
+        with open(args.prompt) as f:
+            initial_prompt = f.read()
+
+    max_iter = 1 if args.no_optimize else args.max_iter
+
+    run_optimization(
+        base_url=args.base_url,
+        model=args.model,
+        test_file=args.test_file,
+        initial_prompt=initial_prompt,
+        n_runs=args.n_runs,
+        max_iterations=max_iter,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        reasoning_effort=args.reasoning_effort,
+        output_file=args.output,
+        context_window=args.context_window,
+        verbose=args.verbose,
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,6 @@
 # pcode
 
-Single-file AI chat client with tool use, streaming, and conversation management.
+Single-file AI chat client with tool use, agent tools, and persistent memory.
 
 <p align="center">
   <img src="demo.svg" alt="pcode demo — plan agent exploring codebase" width="680">
@@ -9,8 +9,9 @@ Single-file AI chat client with tool use, streaming, and conversation management
 ## Features
 
 - **Streaming responses** with reasoning display (think tags, vLLM reasoning fields)
-- **7 built-in tools**: bash, read_file, write_file, edit_file, search, math, web_fetch
-- **3 agent tools**: task (autonomous work), plan (writes `.plan.md`), review (returned inline)
+- **10 built-in tools**: bash, read_file, write_file, edit_file, search, math, web_fetch, memorize, forget, recall
+- **4 agent tools**: task (autonomous work), plan (writes `.plan.md`), research (read-only investigation), review (returned inline)
+- **Persistent memory** across sessions — memorize facts, recall past conversations (SQLite-backed)
 - **Tool approval workflow** with user feedback (`y, use absolute path`)
 - **Conversation compaction** for long sessions (auto-triggers at 80% context)
 - **Markdown rendering** with ANSI colors in terminal
@@ -55,18 +56,20 @@ Every tool call shows a preview and asks for approval:
 |---------|-------------|
 | `/compact` | Summarize conversation to free context |
 | `/creative` | Toggle creative writing mode (disables tools) |
+| `/history [query]` | Show recent history, or search past conversations |
 | `/reason low\|medium\|high` | Adjust reasoning effort |
 | `/debug` | Toggle debug mode (shows full API requests) |
 | `/usage` | Show token usage breakdown |
 
 ### Agent tools
 
-Three agent tools delegate work to autonomous sub-agents with read-only tool access:
+Four agent tools delegate work to autonomous sub-agents:
 
 | Tool | Purpose | Output |
 |------|---------|--------|
-| `task` | General autonomous work | Returned inline |
-| `plan` | Explore codebase, design implementation | Written to `.plan.md` |
+| `task` | General autonomous work (full tool access) | Returned inline |
+| `plan` | Explore codebase, design implementation | Written to `.plan.md`, shown for approval |
+| `research` | Deep read-only codebase investigation | Returned inline |
 | `review` | Code review for correctness, security, style | Returned inline |
 
 ```
@@ -79,7 +82,15 @@ User: Review the auth module for security issues
   [review done] 2340 chars
 ```
 
-Agents have read-only tool access (read_file, search, math, web_fetch). Write operations require the main conversation's approval flow.
+Read-only agents (research, plan, review) have access to read_file, search, math, and web_fetch. The task agent also has bash, write_file, and edit_file — write operations go through the main conversation's approval flow.
+
+### Persistent memory
+
+All conversations are stored in `~/.pcode_memories.db` (SQLite) and persist across sessions.
+
+- **memorize** — the model stores key-value facts (IPs, paths, conventions) that are always visible in its instructions
+- **recall** — the model searches past conversation history to find prior discussions and decisions
+- **`/history`** — CLI command to browse or search your conversation history
 
 ## Requirements
 

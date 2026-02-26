@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "pcode"
 version = "0.1.0"
-description = "Single-file AI chat client with tool use, streaming, and conversation management."
+description = "Single-file AI chat client with tool use, agent tools, and persistent memory."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -13,3 +13,4 @@ dependencies = ["openai>=1.0"]
 
 [project.scripts]
 pcode = "pcode.chat:main"
+pcode-eval = "pcode.eval:main"
