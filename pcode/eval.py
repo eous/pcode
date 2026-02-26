@@ -594,63 +594,49 @@ def _run_iteration(
 
 
 OPTIMIZER_SYSTEM = """\
-You are a prompt engineer optimizing a developer message for an AI coding assistant.
+You are a text rewriter. You receive a short paragraph and test results \
+showing how well it performed. Your job: rewrite the paragraph to improve \
+clarity, flow, and natural prose while maintaining the original meaning \
+and preserving any phrases that correlate with 100% test scores.
 
-The chat template automatically builds the system message (persona, knowledge \
-cutoff, date, reasoning effort, channel declarations, tool schemas). You are \
-optimizing only the developer message, which the template wraps with \
-"# Instructions\\n\\n" and appends tool definitions after.
+Style: flowing prose in 2-3 short paragraphs. No bullet points, no \
+numbered lists, no bold headers, no numbered formatting, no structured \
+sections.
 
-You will see test results showing which cases pass and fail. Study the \
-failure patterns carefully — the most common failure is the model returning \
-NO tool calls at all (tools=[]). Your prompt must make tool usage feel like \
-the natural default, not an option.
+Length: no longer than 120% of the original paragraph's length. If you \
+must add a phrase to fix a failing test, include it only if it directly \
+improves the paragraph's performance on the test criteria.
 
-Style constraint: the model follows natural prose better than structured \
-rules. Avoid bullet points, numbered lists, and formal rule language. Write \
-in flowing sentences — 2-3 short paragraphs is ideal.
+Constraints: Do not add unnecessary content or restructure beyond what \
+is needed for improvement. Penalize yourself 15-20% for any structured \
+formatting. Focus on natural sentences.
 
-Length target: aim for 600-1200 chars. Brevity helps, but not at the cost \
-of missing critical behavioral guidance. If a specific instruction would \
-fix a failing test case, include it even if it adds length.
-
-Be bold — if the current prompt is failing on specific cases, make targeted \
-changes to address them. You can restructure, reword, or add new guidance. \
-Don't just tweak punctuation. But preserve patterns that are already working \
-(look at which cases score 100%).
-
-Output ONLY the new developer message — no commentary, no explanation, \
-no markdown fences, no meta-commentary about your changes.\
+Output ONLY the rewritten paragraph. No commentary, no fences, no \
+explanation of changes.\
 """
 
 
 OBSERVER_SYSTEM = """\
-You are a meta-optimizer tuning a prompt engineer's developer prompt.
+You edit the rewriter's instructions shown below. The rewriter takes a \
+paragraph and test results, then rewrites the paragraph to score higher. \
+Your job: tune the rewriter's instructions so it does a better job.
 
-You receive the engineer's current developer prompt and iteration history \
-showing score changes, prompt diffs, and per-case regressions.
+Your output replaces the rewriter's instructions. It must stay at the \
+same level — telling the rewriter HOW to rewrite, not doing the \
+rewriting yourself.
 
-Your job: edit the developer prompt so the engineer produces better results. \
-Look at what changed between iterations and what happened to scores.
+Example of the right level (abbreviated):
+\"\"\"
+You are a text rewriter. You receive a paragraph and test results...
+Style: flowing prose, no bullet points...
+Length: aim for 600-1200 chars...
+Be bold — reword, restructure...
+\"\"\"
 
-Here's what good optimizer edits look like — scores went up after these:
-- Replacing "Always read files before editing" with "Study the failure \
-patterns — when tools=[] appears, the prompt needs to make tool calls \
-feel inevitable, not optional"
-- Removing a bullet list and rewriting as a flowing paragraph
-- Adding "Be bold — restructure if needed" when the optimizer was only \
-tweaking punctuation
+Make 2-3 targeted edits based on the iteration history. Remove guidance \
+that isn't working. Stay under 150% of the input length.
 
-Here's what bad optimizer edits look like — scores dropped after these:
-- Adding 10+ "Do NOT" rules that the engineer parrots into the prompt
-- Converting prose into numbered steps or checklists
-- Growing the prompt past 1200 chars with redundant restatements
-- Adding generic advice not tied to any specific failing test case
-
-Keep your edits to 2-3 changes per cycle. Remove guidance that isn't \
-producing results. Your output must stay under 150% of the input length.
-
-Output ONLY the modified developer prompt. No commentary.\
+Output ONLY the modified rewriter instructions.\
 """
 
 
@@ -697,9 +683,37 @@ def _observe_and_update_optimizer(
             part += f"  Diff:\n{diff_text}\n"
         parts.append(part)
 
+    # Summarize what the optimizer's output looked like (without showing
+    # full developer messages, which cause the observer to mimic them)
+    behavior_notes = []
+    for it in iterations[-3:]:
+        idx = it.get("iteration", "?")
+        prompt = it.get("prompt", "")
+        score = it.get("aggregate", {}).get("overall_pass_rate", 0)
+        has_bullets = "- " in prompt or "* " in prompt
+        has_numbers = bool(re.search(r"^\d+\.", prompt, re.MULTILINE))
+        has_headers = "**" in prompt or "##" in prompt
+        notes = []
+        if has_bullets or has_numbers:
+            notes.append("used bullet/numbered lists")
+        if has_headers:
+            notes.append("used bold headers")
+        if len(prompt) > 1200:
+            notes.append(f"length={len(prompt)} chars (over 1200)")
+        elif len(prompt) < 600:
+            notes.append(f"length={len(prompt)} chars (under 600)")
+        else:
+            notes.append(f"length={len(prompt)} chars")
+        style = ", ".join(notes) if notes else "prose style"
+        behavior_notes.append(f"Iteration {idx} ({score:.0%}): {style}")
+
     user_content = (
-        f"## Current Prompt Engineer System Prompt\n```\n{optimizer_system}\n```\n\n"
-        f"## Iteration History\n" + "\n".join(parts)
+        f"## Rewriter Instructions (edit these)\n"
+        f"```\n{optimizer_system}\n```\n\n"
+        f"## What the Rewriter Produced (do NOT mimic this)\n"
+        + "\n".join(behavior_notes)
+        + f"\n\n## Iteration History\n"
+        + "\n".join(parts)
     )
 
     response = client.chat.completions.create(
@@ -883,6 +897,12 @@ def run_optimization(
         initial_prompt = next(
             m["content"] for m in tmp.system_messages if m["role"] == "developer"
         )
+        # Strip memory reminder — it's a runtime artifact, not part of the prompt
+        initial_prompt = re.sub(
+            r"\n*REMINDER: You currently have \d+ memories stored\..*$",
+            "",
+            initial_prompt,
+        ).strip()
 
     current_prompt = initial_prompt
     results = {
