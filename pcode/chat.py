@@ -319,25 +319,28 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "research",
+            "name": "web_search",
             "description": (
-                "Spawn an autonomous agent for deep codebase investigation. "
-                "The agent reads files, searches across the codebase, and "
-                "synthesizes findings into a structured report with file paths "
-                "and line numbers. Use research when asked to investigate, "
-                "analyze, explain, or understand code — it handles multi-file "
-                "exploration more thoroughly than manual read_file/search. "
-                "The agent is read-only and cannot modify files."
+                "Search the web using a text query. Returns ranked results "
+                "with titles, URLs, and content snippets."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "prompt": {
+                    "query": {
                         "type": "string",
-                        "description": "Complete research description for the sub-agent.",
+                        "description": "The search query.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max results to return (default 5, max 20).",
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Search topic: general, news, or finance (default general).",
                     },
                 },
-                "required": ["prompt"],
+                "required": ["query"],
             },
         },
     },
@@ -381,29 +384,6 @@ TOOLS = [
                     "prompt": {
                         "type": "string",
                         "description": "What to plan — the goal, constraints, and scope.",
-                    },
-                },
-                "required": ["prompt"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "code_review",
-            "description": (
-                "Spawn an autonomous agent to review code for bugs, security "
-                "vulnerabilities, and quality issues. The agent examines files, "
-                "traces logic, and returns a structured report of findings. "
-                "Use code_review when asked to review, audit, or check code "
-                "— it produces more thorough analysis than manual inspection."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "What to review — file paths, scope, and focus areas.",
                     },
                 },
                 "required": ["prompt"],
@@ -481,12 +461,13 @@ TOOLS = [
     },
 ]
 
-# Tools available to read-only sub-agents (research, plan, code_review).
+# Tools available to read-only sub-agents (plan).
 # Excludes agent tools (no recursion) and write tools (security boundary).
 AGENT_TOOLS = [
     t
     for t in TOOLS
-    if t["function"]["name"] in ("read_file", "search", "math", "web_fetch")
+    if t["function"]["name"]
+    in ("read_file", "search", "math", "web_fetch", "web_search")
 ]
 
 # Tools available to the task sub-agent (read + write + execute).
@@ -495,7 +476,16 @@ TASK_AGENT_TOOLS = [
     t
     for t in TOOLS
     if t["function"]["name"]
-    in ("read_file", "search", "math", "web_fetch", "bash", "write_file", "edit_file")
+    in (
+        "read_file",
+        "search",
+        "math",
+        "web_fetch",
+        "web_search",
+        "bash",
+        "write_file",
+        "edit_file",
+    )
 ]
 
 # ─── Edit helpers ─────────────────────────────────────────────────────────
@@ -931,6 +921,31 @@ _db_override: str | None = None
 _db_initialized: set[str] = set()
 _fts5_available: bool = False
 
+_tavily_key: str | None = None
+_tavily_key_loaded: bool = False
+
+
+def _get_tavily_key() -> str | None:
+    """Load Tavily API key from file or env var (cached after first call)."""
+    global _tavily_key, _tavily_key_loaded
+    if _tavily_key_loaded:
+        return _tavily_key
+    _tavily_key_loaded = True
+    key_path = os.path.expanduser("~/.config/pcode/tavily_key")
+    if os.path.isfile(key_path):
+        try:
+            with open(key_path) as f:
+                key = f.read().strip()
+            if key:
+                _tavily_key = key
+                return _tavily_key
+        except OSError:
+            pass
+    env_key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if env_key:
+        _tavily_key = env_key
+    return _tavily_key
+
 
 def _open_db() -> sqlite3.Connection:
     """Open the pcode database, creating tables on first use per path."""
@@ -1282,15 +1297,12 @@ class ChatSession:
                 "them directly with write_file. For existing ones, read first "
                 "and then edit. When you need to find something in the codebase, "
                 "search for it and then read the file where it's found. Use "
-                "specialized tools like plan, research, or code_review when you "
-                "need to think through, investigate, or review work because "
-                "they're designed for analysis that direct tools can't provide. "
-                "Run commands directly with bash, and run tests with pytest. "
-                "When you need to check for bugs or improve code, review it. "
-                "When you need to learn what a file contains, research it. "
-                "And when you need to get a URL's contents, fetch it. "
-                "When in doubt, read the file first and use code_review after "
-                "making changes, even if you think it's faster not to.",
+                "plan when you need to think through multi-file changes before "
+                "implementing, and task when you need to delegate self-contained "
+                "work to a sub-agent. Run commands directly with bash, and run "
+                "tests with pytest. When you need to look something up online, "
+                "use web_search to find it and web_fetch to read a specific page. "
+                "When in doubt, read the file first before making changes.",
             ]
         if self.instructions:
             dev_parts.append("")
@@ -2074,10 +2086,9 @@ class ChatSession:
             "write_file": "content",
             "edit_file": "old_string",
             "web_fetch": "url",
-            "research": "prompt",
+            "web_search": "query",
             "task": "prompt",
             "plan": "prompt",
-            "code_review": "prompt",
             "remember": "key",
             "recall": "query",
             "forget": "key",
@@ -2095,6 +2106,7 @@ class ChatSession:
                 "path",
                 "pattern",
                 "prompt",
+                "query",
                 "url",
             ):
                 m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_args)
@@ -2133,10 +2145,9 @@ class ChatSession:
             "edit_file": self._prepare_edit_file,
             "math": self._prepare_math,
             "web_fetch": self._prepare_web_fetch,
-            "research": self._prepare_research,
+            "web_search": self._prepare_web_search,
             "task": self._prepare_task,
             "plan": self._prepare_plan,
-            "code_review": self._prepare_code_review,
             "remember": self._prepare_remember,
             "recall": self._prepare_recall,
             "forget": self._prepare_forget,
@@ -2603,28 +2614,51 @@ class ChatSession:
             "question": question,
         }
 
-    def _prepare_research(self, call_id: str, args: dict) -> dict:
-        """Prepare a research sub-agent for approval."""
-        prompt = (args.get("prompt") or "").strip()
-        if not prompt:
+    def _prepare_web_search(self, call_id: str, args: dict) -> dict:
+        """Prepare a web search via Tavily for approval."""
+        query = (args.get("query") or "").strip()
+        if not query:
             return {
                 "call_id": call_id,
-                "func_name": "research",
-                "header": "✗ research: empty prompt",
+                "func_name": "web_search",
+                "header": "✗ web_search: empty query",
                 "preview": "",
                 "needs_approval": False,
-                "error": "Error: empty prompt",
+                "error": "Error: no query provided",
             }
-        preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
+        if not _get_tavily_key():
+            return {
+                "call_id": call_id,
+                "func_name": "web_search",
+                "header": "✗ web_search: no API key",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    "Error: Tavily API key not configured. "
+                    "Set it in ~/.config/pcode/tavily_key or $TAVILY_API_KEY. "
+                    "Use web_fetch with a direct URL as an alternative."
+                ),
+            }
+        try:
+            max_results = min(max(int(args.get("max_results") or 5), 1), 20)
+        except (ValueError, TypeError):
+            max_results = 5
+        topic = args.get("topic", "general") or "general"
+        if topic not in ("general", "news", "finance"):
+            topic = "general"
+        q_preview = query[:200] + ("..." if len(query) > 200 else "")
+        preview = f"    {DIM}{q_preview}{RESET}"
         return {
             "call_id": call_id,
-            "func_name": "research",
-            "header": "⚙ research (read-only agent)",
-            "preview": f"    {DIM}{preview_text}{RESET}",
+            "func_name": "web_search",
+            "header": f"⚙ web_search: {query[:80]}",
+            "preview": preview,
             "needs_approval": True,
-            "approval_label": "research",
-            "execute": self._exec_research,
-            "prompt": prompt,
+            "approval_label": "web_search",
+            "execute": self._exec_web_search,
+            "query": query,
+            "max_results": max_results,
+            "topic": topic,
         }
 
     def _prepare_task(self, call_id: str, args: dict) -> dict:
@@ -2672,30 +2706,6 @@ class ChatSession:
             "needs_approval": True,
             "approval_label": "plan",
             "execute": self._exec_plan,
-            "prompt": prompt,
-        }
-
-    def _prepare_code_review(self, call_id: str, args: dict) -> dict:
-        """Prepare a code review agent for approval."""
-        prompt = (args.get("prompt") or "").strip()
-        if not prompt:
-            return {
-                "call_id": call_id,
-                "func_name": "code_review",
-                "header": "✗ code_review: empty prompt",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: empty prompt",
-            }
-        preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
-        return {
-            "call_id": call_id,
-            "func_name": "code_review",
-            "header": "⚙ code_review (code review agent)",
-            "preview": f"    {DIM}{preview_text}{RESET}",
-            "needs_approval": True,
-            "approval_label": "code_review",
-            "execute": self._exec_code_review,
             "prompt": prompt,
         }
 
@@ -2941,7 +2951,7 @@ class ChatSession:
     # Tools the agent can auto-execute without user approval (read-only).
     # bash, write_file, edit_file are excluded — the user approval prompt
     # is the primary security boundary against prompt injection.
-    _AGENT_AUTO_TOOLS = {"read_file", "search", "math", "web_fetch"}
+    _AGENT_AUTO_TOOLS = {"read_file", "search", "math", "web_fetch", "web_search"}
 
     def _run_agent(
         self,
@@ -3025,7 +3035,7 @@ class ChatSession:
                 tool_name = tc.function.name
 
                 # Guard 1: block recursive agent calls.
-                if tool_name in ("research", "task", "plan", "code_review"):
+                if tool_name in ("task", "plan"):
                     output = "Error: agents cannot spawn further agents"
                 # Guard 2: tool not in this agent's API tool list.
                 elif tool_name not in tool_names:
@@ -3098,49 +3108,6 @@ class ChatSession:
             sys.stdout.flush()
         return content
 
-    def _exec_research(self, item: dict) -> tuple[str, str]:
-        """Delegate to a read-only research sub-agent."""
-        call_id, prompt = item["call_id"], item["prompt"]
-        research_instruction = {
-            "role": "developer",
-            "content": (
-                "# Research Agent (read-only)\n\n"
-                "You are a read-only research agent. You can ONLY use search, "
-                "read_file, math, and web_fetch. You CANNOT use bash, write_file, "
-                "or edit_file.\n\n"
-                "1. **Investigate thoroughly:** Use search and read_file to gather "
-                "evidence before drawing conclusions. Do not guess — verify.\n\n"
-                "2. **Output format:**\n"
-                "   - Lead with the direct answer or finding.\n"
-                "   - Follow with supporting evidence (file paths, line numbers, "
-                "code snippets).\n"
-                "   - End with any caveats or related findings.\n\n"
-                "3. **Tool usage rules:**\n"
-                "   - Use search to locate relevant code across the codebase.\n"
-                "   - Use read_file to examine specific files in detail.\n"
-                "   - Use math for calculations and web_fetch for external data.\n"
-                "   - Do NOT use bash, write_file, or edit_file — you have no "
-                "access to these tools.\n\n"
-                "4. **Common mistakes to avoid:**\n"
-                "   - Answering without reading the relevant code first\n"
-                "   - Searching too broadly when a specific file is named\n"
-                "   - Returning vague findings without file paths or line numbers"
-            ),
-        }
-        agent_messages = list(self._agent_system_messages) + [
-            research_instruction,
-            {"role": "user", "content": prompt},
-        ]
-        try:
-            return call_id, self._run_agent(agent_messages, label="research")
-        except KeyboardInterrupt:
-            return call_id, "(research interrupted by user)"
-        except Exception as e:
-            with self._print_lock:
-                sys.stdout.write(f"  {DIM}[research error] {e}{RESET}\n")
-                sys.stdout.flush()
-            return call_id, f"Research error: {e}"
-
     # Task agent read-only tools auto-execute without approval.
     # bash, write_file, edit_file are in TASK_AGENT_TOOLS (the API tool list)
     # but NOT here — they go through _display_and_approve for user approval.
@@ -3149,6 +3116,7 @@ class ChatSession:
         "search",
         "math",
         "web_fetch",
+        "web_search",
     }
 
     def _exec_task(self, item: dict) -> tuple[str, str]:
@@ -3160,7 +3128,7 @@ class ChatSession:
                 "# Task Agent\n\n"
                 "You are an autonomous task agent with full tool access. "
                 "You can use bash, read_file, write_file, edit_file, search, "
-                "math, and web_fetch.\n\n"
+                "math, web_fetch, and web_search.\n\n"
                 "1. **Follow through on actions:** Do not describe changes — "
                 "use the tools to make them. After read_file, call edit_file "
                 "or write_file.\n\n"
@@ -3254,52 +3222,6 @@ class ChatSession:
                 sys.stdout.flush()
 
         return call_id, content
-
-    def _exec_code_review(self, item: dict) -> tuple[str, str]:
-        """Run a code review agent and return findings as tool response."""
-        call_id, prompt = item["call_id"], item["prompt"]
-
-        review_instruction = {
-            "role": "developer",
-            "content": (
-                "# Code Review Agent\n\n"
-                "1. **Read before judging:** Use read_file to examine every file under "
-                "review. Do not comment on code you haven't read. Use search to find "
-                "related callers or dependencies when assessing impact.\n\n"
-                "2. **Output format** — use these exact sections:\n"
-                "   - **## Summary**: Overall assessment (1-2 sentences).\n"
-                "   - **## Critical Issues**: Bugs, security vulnerabilities, data loss risks. "
-                "These MUST be fixed.\n"
-                "   - **## Suggestions**: Performance, readability, maintainability improvements. "
-                "Nice to fix but not blocking.\n"
-                "   - **## Positive Notes**: Well-designed patterns worth preserving.\n\n"
-                "3. **Evidence rules:**\n"
-                "   - For each issue, include the file path, line number, and a code snippet.\n"
-                "   - Prioritize correctness and security over style.\n"
-                '   - Distinguish between "must fix" (Critical) and "should fix" (Suggestions).\n\n'
-                "4. **Common mistakes to avoid:**\n"
-                "   - Reviewing code without reading it first\n"
-                "   - Raising style nits as critical issues\n"
-                "   - Missing security vulnerabilities (injection, auth, data exposure)\n"
-                "   - Ignoring error handling and edge cases"
-            ),
-        }
-        agent_messages = list(self._agent_system_messages) + [
-            review_instruction,
-            {"role": "user", "content": prompt},
-        ]
-
-        try:
-            return call_id, self._run_agent(
-                agent_messages, label="code_review", reasoning_effort="high"
-            )
-        except KeyboardInterrupt:
-            return call_id, "(code_review interrupted by user)"
-        except Exception as e:
-            with self._print_lock:
-                sys.stdout.write(f"  {DIM}[code_review error] {e}{RESET}\n")
-                sys.stdout.flush()
-            return call_id, f"Code review error: {e}"
 
     def _exec_remember(self, item: dict) -> tuple[str, str]:
         """Save a persistent memory."""
@@ -3595,6 +3517,68 @@ class ChatSession:
             sys.stdout.flush()
 
         return call_id, answer
+
+    def _exec_web_search(self, item: dict) -> tuple[str, str]:
+        """Search the web via Tavily API."""
+        call_id = item["call_id"]
+        query = item["query"]
+        max_results = item.get("max_results", 5)
+        topic = item.get("topic", "general")
+        api_key = _get_tavily_key()
+
+        payload = json.dumps(
+            {
+                "query": query,
+                "max_results": max_results,
+                "topic": topic,
+                "include_answer": True,
+            }
+        ).encode()
+        req = Request(
+            "https://api.tavily.com/search",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=self.tool_timeout) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            msg = f"Tavily search failed: {e}"
+            with self._print_lock:
+                sys.stdout.write(f"    {red(msg)}\n")
+                sys.stdout.flush()
+            return call_id, msg
+
+        parts: list[str] = []
+        answer = (data.get("answer") or "").strip()
+        if answer:
+            parts.append(f"Answer: {answer}")
+
+        results = data.get("results") or []
+        if results:
+            lines = []
+            for i, r in enumerate(results, 1):
+                title = r.get("title", "")
+                url = r.get("url", "")
+                content = (r.get("content") or "")[:500]
+                lines.append(f"{i}. [{title}]({url})\n   {content}")
+            parts.append("\n".join(lines))
+
+        output = "\n\n".join(parts) if parts else f"No results for '{query}'."
+
+        with self._print_lock:
+            preview = output[:400]
+            if len(output) > 400:
+                preview += "..."
+            indented = textwrap.indent(preview, "    ")
+            sys.stdout.write(f"{DIM}{indented}{RESET}\n")
+            sys.stdout.flush()
+
+        return call_id, output
 
     def handle_command(self, cmd_line: str) -> bool:
         """Handle slash commands. Returns True if should exit."""

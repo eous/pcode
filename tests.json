@@ -159,31 +159,6 @@
       "match_mode": "subset"
     },
     {
-      "id": "research-for-investigation",
-      "description": "Use research tool for read-only codebase investigation",
-      "user_prompt": "Use the research tool to investigate: what functions are defined in utils.py and what does each one do?",
-      "setup": {
-        "files": {
-          "utils.py": "import os\nimport re\n\n\ndef slugify(text):\n    \"\"\"Convert text to URL-friendly slug.\"\"\"\n    text = text.lower().strip()\n    return re.sub(r'[^a-z0-9]+', '-', text).strip('-')\n\n\ndef file_size(path):\n    \"\"\"Return human-readable file size.\"\"\"\n    size = os.path.getsize(path)\n    for unit in ('B', 'KB', 'MB', 'GB'):\n        if size < 1024:\n            return f'{size:.1f} {unit}'\n        size /= 1024\n    return f'{size:.1f} TB'\n\n\ndef flatten(nested):\n    \"\"\"Flatten a nested list.\"\"\"\n    result = []\n    for item in nested:\n        if isinstance(item, list):\n            result.extend(flatten(item))\n        else:\n            result.append(item)\n    return result\n",
-          "main.py": "from utils import slugify\n\nprint(slugify('Hello World!'))\n"
-        }
-      },
-      "expected_actions": [{ "tool": "research" }],
-      "match_mode": "subset"
-    },
-    {
-      "id": "code-review-after-changes",
-      "description": "Use code_review tool when asked to review code",
-      "user_prompt": "Review utils.py for bugs and security issues",
-      "setup": {
-        "files": {
-          "utils.py": "import os\nimport subprocess\n\n\ndef run_command(user_input):\n    result = subprocess.run(user_input, shell=True, capture_output=True)\n    return result.stdout.decode()\n\n\ndef read_config(path):\n    with open(path) as f:\n        return eval(f.read())\n\n\ndef delete_file(path):\n    os.remove('/data/' + path)\n"
-        }
-      },
-      "expected_actions": [{ "tool": "code_review" }],
-      "match_mode": "subset"
-    },
-    {
       "id": "web-fetch-url",
       "description": "Use web_fetch when asked to retrieve content from a URL",
       "user_prompt": "Fetch the contents of https://example.com and summarize what's on the page",

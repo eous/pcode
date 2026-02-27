@@ -532,6 +532,18 @@ def _run_iteration(
                 ]
                 score_result["elapsed"] = run_result.get("elapsed", 0)
 
+                # Detect JSON dumped into final channel (tool call not made)
+                fc = (run_result.get("final_content") or "").strip()
+                if fc and not score_result["pass"]:
+                    has_json = bool(
+                        re.search(
+                            r'\{\s*"(tool|function|name|arguments|command|query|path|url)"',
+                            fc,
+                        )
+                    )
+                    if has_json:
+                        score_result["json_dump"] = True
+
             except Exception as e:
                 score_result = {
                     "pass": False,
@@ -549,11 +561,15 @@ def _run_iteration(
             status_label = "PASS" if passed else "FAIL"
             tools = score_result.get("tool_sequence", [])
             elapsed = score_result.get("elapsed", 0)
+            json_flag = (
+                f" {YELLOW}[JSON_DUMP]{RESET}" if score_result.get("json_dump") else ""
+            )
             print(
                 f"    Run {run_idx + 1}: "
                 f"{status_color}[{status_label}]{RESET} "
                 f"score={score_result['score']:.2f} "
                 f"tools={tools}"
+                f"{json_flag}"
                 f"  {DIM}({elapsed:.1f}s){RESET}"
             )
 
@@ -571,6 +587,9 @@ def _run_iteration(
     total_passes = sum(
         sum(1 for r in cr["runs"] if r["pass"]) for cr in case_results.values()
     )
+    total_json_dumps = sum(
+        sum(1 for r in cr["runs"] if r.get("json_dump")) for cr in case_results.values()
+    )
 
     return {
         "cases": case_results,
@@ -578,6 +597,7 @@ def _run_iteration(
             "total_cases": len(cases),
             "total_runs": total_runs,
             "overall_pass_rate": total_passes / total_runs if total_runs else 0,
+            "json_dumps": total_json_dumps,
             "overall_avg_score": (
                 sum(cr["avg_score"] for cr in case_results.values()) / len(case_results)
                 if case_results
@@ -948,7 +968,9 @@ def run_optimization(
 
         # Print summary
         agg = iter_result["aggregate"]
-        print(f"\nOverall pass rate: {agg['overall_pass_rate']:.0%}")
+        json_dumps = agg.get("json_dumps", 0)
+        jd_str = f"  {YELLOW}json_dumps={json_dumps}{RESET}" if json_dumps else ""
+        print(f"\nOverall pass rate: {agg['overall_pass_rate']:.0%}{jd_str}")
         print(f"Overall avg score: {agg['overall_avg_score']:.2f}")
         for case_id, rate in agg["per_case_pass_rates"].items():
             status = "PASS" if rate == 1.0 else "FAIL"

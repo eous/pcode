@@ -9,9 +9,9 @@ Single-file AI chat client with tool use, agent tools, and persistent memory.
 ## Features
 
 - **Streaming responses** with reasoning display (think tags, vLLM reasoning fields)
-- **10 built-in tools**: bash, read_file, write_file, edit_file, search, math, web_fetch, memorize, forget, recall
-- **4 agent tools**: task (autonomous work), plan (writes `.plan.md`), research (read-only investigation), review (returned inline)
-- **Persistent memory** across sessions — memorize facts, recall past conversations (SQLite-backed)
+- **13 tools**: bash, read_file, write_file, edit_file, search, math, web_fetch, web_search, task, plan, remember, recall, forget
+- **2 agent tools**: task (autonomous work with full tool access), plan (explores codebase, writes `.plan.md`)
+- **Persistent memory** across sessions — remember facts, recall memories and past conversations (SQLite + FTS5 full-text search)
 - **Tool approval workflow** with user feedback (`y, use absolute path`)
 - **Conversation compaction** for long sessions (auto-triggers at 80% context)
 - **Markdown rendering** with ANSI colors in terminal
@@ -63,34 +63,34 @@ Every tool call shows a preview and asks for approval:
 
 ### Agent tools
 
-Four agent tools delegate work to autonomous sub-agents:
+Two agent tools delegate work to autonomous sub-agents:
 
 | Tool | Purpose | Output |
 |------|---------|--------|
 | `task` | General autonomous work (full tool access) | Returned inline |
 | `plan` | Explore codebase, design implementation | Written to `.plan.md`, shown for approval |
-| `research` | Deep read-only codebase investigation | Returned inline |
-| `review` | Code review for correctness, security, style | Returned inline |
 
-```
-User: Review the auth module for security issues
-⚙ review (code review agent)
-    Review auth.py for security vulnerabilities
-    Allow review? [y/n/a(lways), optional message] y
-  [review turn 1] ⚙ read_file: auth.py
-  [review turn 2] ⚙ search: /password|secret|token/ in auth.py
-  [review done] 2340 chars
-```
-
-Read-only agents (research, plan, review) have access to read_file, search, math, and web_fetch. The task agent also has bash, write_file, and edit_file — write operations go through the main conversation's approval flow.
+The plan agent has access to read_file, search, math, web_fetch, and web_search. The task agent also has bash, write_file, and edit_file — write operations go through the main conversation's approval flow.
 
 ### Persistent memory
 
-All conversations are stored in `~/.pcode_memories.db` (SQLite) and persist across sessions.
+All conversations are stored in `.pcode_memories.db` (SQLite) and persist across sessions.
 
-- **memorize** — the model stores key-value facts (IPs, paths, conventions) that are always visible in its instructions
-- **recall** — the model searches past conversation history to find prior discussions and decisions
+- **remember** — save key-value facts (IPs, paths, conventions) that are always visible in the model's instructions
+- **recall** — with no query, lists all memories; with a query, searches both memories and conversation history (FTS5 BM25-ranked)
+- **forget** — remove a saved memory
 - **`/history`** — CLI command to browse or search your conversation history
+
+### Web search (optional)
+
+The `web_search` tool uses the [Tavily API](https://tavily.com). To enable it, set your API key:
+
+```bash
+mkdir -p ~/.config/pcode
+echo "tvly-YOUR_API_KEY" > ~/.config/pcode/tavily_key
+```
+
+Or set the `TAVILY_API_KEY` environment variable. Without a key, the model is told to use `web_fetch` with a direct URL instead.
 
 ## Requirements
 
