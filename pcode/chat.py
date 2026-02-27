@@ -438,51 +438,24 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "remember_list",
-            "description": "List all saved persistent memories.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "remember_search",
-            "description": "Search saved memories by keyword.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search term to match against memory keys and values.",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "recall",
             "description": (
-                "Search past conversation history across all sessions. "
-                "Use to find prior discussions, decisions, commands run, "
-                "or context from earlier work. Returns matching messages "
-                "with timestamps."
+                "Search memories and past conversations. "
+                "With no query, lists all saved memories. "
+                "With a query, searches both memories and conversation history."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search term or phrase to find in past conversations.",
+                        "description": "Search term or phrase. Omit to list all memories.",
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max results to return (default 20).",
+                        "description": "Max conversation results to return (default 20).",
                     },
                 },
-                "required": ["query"],
             },
         },
     },
@@ -956,6 +929,7 @@ def is_command_blocked(cmd: str) -> str | None:
 PCODE_DB = os.path.join(os.getcwd(), ".pcode_memories.db")
 _db_override: str | None = None
 _db_initialized: set[str] = set()
+_fts5_available: bool = False
 
 
 def _open_db() -> sqlite3.Connection:
@@ -978,6 +952,25 @@ def _open_db() -> sqlite3.Connection:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id)"
         )
+        global _fts5_available
+        try:
+            # Check if FTS table already exists
+            fts_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='conversations_fts'"
+            ).fetchone()
+            if not fts_exists:
+                conn.execute(
+                    "CREATE VIRTUAL TABLE conversations_fts "
+                    "USING fts5(content, content=conversations, content_rowid=id)"
+                )
+                conn.execute(
+                    "INSERT INTO conversations_fts(conversations_fts) VALUES('rebuild')"
+                )
+                conn.commit()
+            _fts5_available = True
+        except Exception:
+            _fts5_available = False
         _db_initialized.add(path)
     return conn
 
@@ -1009,6 +1002,7 @@ def _save_message(
     tool_args: str | None = None,
 ) -> None:
     """Log a message to the conversations table."""
+    global _fts5_available
     try:
         conn = _open_db()
         try:
@@ -1017,6 +1011,15 @@ def _save_message(
                 "tool_name, tool_args) VALUES (?, datetime('now'), ?, ?, ?, ?)",
                 (session_id, role, content, tool_name, tool_args),
             )
+            if _fts5_available and content:
+                try:
+                    rowid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    conn.execute(
+                        "INSERT INTO conversations_fts(rowid, content) VALUES (?, ?)",
+                        (rowid, content),
+                    )
+                except Exception:
+                    _fts5_available = False  # degrade to LIKE for rest of session
             conn.commit()
         finally:
             conn.close()
@@ -1029,11 +1032,37 @@ def _escape_like(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _fts5_query(query: str) -> str:
+    """Convert a plain search string into a safe FTS5 query.
+
+    Quotes each term so FTS5 special characters (*, -, etc.) are treated
+    as literals, then joins with implicit AND.  Embedded double quotes
+    are doubled per FTS5 quoting convention.
+    """
+    terms = query.split()
+    safe = []
+    for t in terms:
+        if t:
+            safe.append(f'"{t.replace(chr(34), chr(34) + chr(34))}"')
+    return " ".join(safe)
+
+
 def _search_history(query: str, limit: int = 20) -> list[tuple]:
     """Search conversation history. Returns (timestamp, session_id, role, content, tool_name)."""
+    if not query or not query.strip():
+        return []
     try:
         conn = _open_db()
         try:
+            if _fts5_available:
+                return conn.execute(
+                    "SELECT c.timestamp, c.session_id, c.role, c.content, c.tool_name "
+                    "FROM conversations_fts f "
+                    "JOIN conversations c ON c.id = f.rowid "
+                    "WHERE conversations_fts MATCH ? "
+                    "ORDER BY f.rank ASC LIMIT ?",
+                    (_fts5_query(query), min(limit, 100)),
+                ).fetchall()
             return conn.execute(
                 "SELECT timestamp, session_id, role, content, tool_name "
                 "FROM conversations WHERE content LIKE ? ESCAPE '\\' "
@@ -1271,7 +1300,7 @@ class ChatSession:
             dev_parts.append("")
             dev_parts.append(
                 f"REMINDER: You currently have {len(memories)} memories stored. "
-                "Use remember_list to see them."
+                "Use recall to see them."
             )
         self.system_messages.append(
             {"role": "developer", "content": "\n".join(dev_parts)}
@@ -1338,8 +1367,6 @@ class ChatSession:
                         name = fn.get("name", "")
                         if name not in (
                             "remember",
-                            "remember_list",
-                            "remember_search",
                             "forget",
                             "recall",
                         ):
@@ -1385,12 +1412,10 @@ class ChatSession:
                     self._msg_tokens.append(
                         max(1, int(len(output) / self._chars_per_token))
                     )
-                    # Log tool result (skip memory/recall tools to avoid noise)
+                    # Log tool result (skip memory tools to avoid noise)
                     _tname = _tc_names.get(tc_id, "")
                     if _tname not in (
                         "remember",
-                        "remember_list",
-                        "remember_search",
                         "forget",
                         "recall",
                     ):
@@ -2054,8 +2079,6 @@ class ChatSession:
             "plan": "prompt",
             "code_review": "prompt",
             "remember": "key",
-            "remember_list": "query",
-            "remember_search": "query",
             "recall": "query",
             "forget": "key",
         }
@@ -2115,8 +2138,6 @@ class ChatSession:
             "plan": self._prepare_plan,
             "code_review": self._prepare_code_review,
             "remember": self._prepare_remember,
-            "remember_list": self._prepare_remember_list,
-            "remember_search": self._prepare_remember_search,
             "recall": self._prepare_recall,
             "forget": self._prepare_forget,
         }
@@ -2702,39 +2723,6 @@ class ChatSession:
             "value": value,
         }
 
-    def _prepare_remember_list(self, call_id: str, args: dict) -> dict:
-        """Prepare a remember_list action."""
-        return {
-            "call_id": call_id,
-            "func_name": "remember_list",
-            "header": "⚙ remember_list",
-            "preview": "",
-            "needs_approval": False,
-            "execute": self._exec_remember_list,
-        }
-
-    def _prepare_remember_search(self, call_id: str, args: dict) -> dict:
-        """Prepare a remember_search action."""
-        query = (args.get("query") or "").strip()
-        if not query:
-            return {
-                "call_id": call_id,
-                "func_name": "remember_search",
-                "header": "✗ remember_search: empty query",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: query is required",
-            }
-        return {
-            "call_id": call_id,
-            "func_name": "remember_search",
-            "header": f"⚙ remember_search: {query[:80]}",
-            "preview": "",
-            "needs_approval": False,
-            "execute": self._exec_remember_search,
-            "query": query,
-        }
-
     def _prepare_forget(self, call_id: str, args: dict) -> dict:
         """Prepare a forget (delete memory) action."""
         key = _normalize_key((args.get("key") or "").strip())
@@ -2758,7 +2746,7 @@ class ChatSession:
         }
 
     def _prepare_recall(self, call_id: str, args: dict) -> dict:
-        """Prepare a recall search."""
+        """Prepare a recall action."""
         query = (args.get("query") or "").strip()
         limit = args.get("limit", 20)
         if isinstance(limit, str):
@@ -2766,19 +2754,10 @@ class ChatSession:
                 limit = int(limit)
             except ValueError:
                 limit = 20
-        if not query:
-            return {
-                "call_id": call_id,
-                "func_name": "recall",
-                "header": "✗ recall: empty query",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: empty query",
-            }
         return {
             "call_id": call_id,
             "func_name": "recall",
-            "header": f"⚙ recall: {query[:80]}",
+            "header": f"⚙ recall{': ' + query[:80] if query else ''}",
             "preview": "",
             "needs_approval": False,
             "execute": self._exec_recall,
@@ -3354,54 +3333,6 @@ class ChatSession:
         except Exception as e:
             return call_id, f"Error: {e}"
 
-    def _exec_remember_list(self, item: dict) -> tuple[str, str]:
-        """List all persistent memories."""
-        call_id = item["call_id"]
-        try:
-            conn = _open_db()
-            try:
-                rows = conn.execute(
-                    "SELECT key, value FROM memories ORDER BY key"
-                ).fetchall()
-                if not rows:
-                    output = "No memories stored."
-                else:
-                    output = "\n".join(f"{k}={v}" for k, v in rows)
-                with self._print_lock:
-                    sys.stdout.write(f"    {DIM}{output}{RESET}\n")
-                    sys.stdout.flush()
-                return call_id, output
-            finally:
-                conn.close()
-        except Exception as e:
-            return call_id, f"Error: {e}"
-
-    def _exec_remember_search(self, item: dict) -> tuple[str, str]:
-        """Search memories by keyword."""
-        call_id, query = item["call_id"], item["query"]
-        try:
-            conn = _open_db()
-            try:
-                escaped = _escape_like(query)
-                rows = conn.execute(
-                    "SELECT key, value FROM memories "
-                    "WHERE key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\' "
-                    "ORDER BY key",
-                    (f"%{escaped}%", f"%{escaped}%"),
-                ).fetchall()
-                if not rows:
-                    output = f"No memories matching '{query}'."
-                else:
-                    output = "\n".join(f"{k}={v}" for k, v in rows)
-                with self._print_lock:
-                    sys.stdout.write(f"    {DIM}{output}{RESET}\n")
-                    sys.stdout.flush()
-                return call_id, output
-            finally:
-                conn.close()
-        except Exception as e:
-            return call_id, f"Error: {e}"
-
     def _exec_forget(self, item: dict) -> tuple[str, str]:
         """Remove a persistent memory by key."""
         call_id, key = item["call_id"], item["key"]
@@ -3425,23 +3356,62 @@ class ChatSession:
             return call_id, f"Error: {e}"
 
     def _exec_recall(self, item: dict) -> tuple[str, str]:
-        """Search past conversation history."""
+        """Search memories and conversation history."""
         call_id = item["call_id"]
         query, limit = item["query"], item["limit"]
-        rows = _search_history(query, limit)
-        if not rows:
-            output = f"No past conversations matching '{query}'."
-        else:
-            lines = []
-            for ts, sid, role, content, tool_name in rows:
-                label = role
-                if tool_name:
-                    label = f"{role}({tool_name})"
-                text = (content or "")[:500]
-                if content and len(content) > 500:
-                    text += "..."
-                lines.append(f"[{ts} session {sid}] {label}: {text}")
-            output = f"Found {len(rows)} results:\n" + "\n".join(lines)
+        parts: list[str] = []
+
+        # Memories: list all (no query) or search (with query)
+        try:
+            conn = _open_db()
+            try:
+                if not query:
+                    rows = conn.execute(
+                        "SELECT key, value FROM memories ORDER BY key"
+                    ).fetchall()
+                else:
+                    terms = query.split()
+                    clauses = []
+                    params: list[str] = []
+                    for t in terms:
+                        escaped = _escape_like(t)
+                        clauses.append(
+                            "(key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\')"
+                        )
+                        params.extend([f"%{escaped}%", f"%{escaped}%"])
+                    rows = conn.execute(
+                        "SELECT key, value FROM memories WHERE "
+                        + " AND ".join(clauses)
+                        + " ORDER BY key",
+                        params,
+                    ).fetchall()
+                if rows:
+                    parts.append(
+                        "Memories:\n" + "\n".join(f"  {k}={v}" for k, v in rows)
+                    )
+                elif not query:
+                    parts.append("No memories stored.")
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+        # Conversations: only when a query is provided
+        if query:
+            conv_rows = _search_history(query, limit)
+            if conv_rows:
+                lines = []
+                for ts, sid, role, content, tool_name in conv_rows:
+                    label = f"{role}({tool_name})" if tool_name else role
+                    text = (content or "")[:500]
+                    if content and len(content) > 500:
+                        text += "..."
+                    lines.append(f"[{ts} {sid}] {label}: {text}")
+                parts.append(
+                    f"Conversations ({len(conv_rows)} matches):\n" + "\n".join(lines)
+                )
+
+        output = "\n\n".join(parts) if parts else f"No results for '{query}'."
         with self._print_lock:
             sys.stdout.write(f"    {DIM}{output}{RESET}\n")
             sys.stdout.flush()
