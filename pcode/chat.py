@@ -295,8 +295,8 @@ TOOLS = [
         "function": {
             "name": "man",
             "description": (
-                "Look up a man page or info page for a command, syscall, or "
-                "library function. Returns the formatted manual entry."
+                "Read a man page. Use this instead of bash('man ...') or "
+                "web_search. Returns the full formatted manual entry."
             ),
             "parameters": {
                 "type": "object",
