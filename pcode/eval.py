@@ -159,6 +159,8 @@ class HeadlessSession(ChatSession):
             }
 
             if choice.message.tool_calls:
+                # Cap parallel tool calls to prevent degenerate repetition
+                calls = choice.message.tool_calls[:10]
                 assistant_msg["tool_calls"] = [
                     {
                         "id": tc.id,
@@ -168,7 +170,7 @@ class HeadlessSession(ChatSession):
                             "arguments": tc.function.arguments,
                         },
                     }
-                    for tc in choice.message.tool_calls
+                    for tc in calls
                 ]
 
             self.messages.append(assistant_msg)
@@ -210,7 +212,26 @@ class HeadlessSession(ChatSession):
                 try:
                     args = json.loads(tc["function"]["arguments"])
                 except json.JSONDecodeError:
-                    args = {"_raw": tc["function"]["arguments"]}
+                    raw = tc["function"]["arguments"]
+                    # Map bare strings to the primary arg key (same as chat.py)
+                    _primary = {
+                        "bash": "command",
+                        "math": "code",
+                        "read_file": "path",
+                        "search": "query",
+                        "write_file": "content",
+                        "edit_file": "old_string",
+                        "man": "page",
+                        "web_fetch": "url",
+                        "web_search": "query",
+                        "task": "prompt",
+                        "plan": "prompt",
+                    }
+                    pk = _primary.get(func_name)
+                    if pk and raw.strip() and not raw.strip().startswith("{"):
+                        args = {pk: raw}
+                    else:
+                        args = {"_raw": raw}
 
                 self.tool_call_log.append(
                     {
@@ -614,25 +635,26 @@ def _run_iteration(
 
 
 OPTIMIZER_SYSTEM = """\
-You are a text rewriter. You receive a short paragraph and test results \
-showing how well it performed. Your job: rewrite the paragraph to improve \
-clarity, flow, and natural prose while maintaining the original meaning \
-and preserving any phrases that correlate with 100% test scores.
+You are a text rewriter. You receive a developer prompt (instructions \
+for a coding assistant on how to use its tools) and test results \
+showing how well the assistant followed them. Rewrite the prompt so \
+the assistant picks the right tools more often.
 
-Style: flowing prose in 2-3 short paragraphs. No bullet points, no \
-numbered lists, no bold headers, no numbered formatting, no structured \
-sections.
+Context: Tests score whether the assistant calls specific tools in \
+the right order. The critical failure modes to address: \
+(1) responding with only text when a tool call is needed — the \
+assistant must ALWAYS call a tool, (2) using write_file to rewrite \
+an entire file instead of edit_file for small changes, (3) not calling \
+plan(prompt='...') when asked to think through a complex task, \
+(4) searching for a file before creating it with write_file. When a \
+test shows 100%, preserve whatever phrasing drove that behavior.
 
-Length: no longer than 120% of the original paragraph's length. If you \
-must add a phrase to fix a failing test, include it only if it directly \
-improves the paragraph's performance on the test criteria.
+Style: direct imperative instructions organized with newlines. Short \
+sentences. Concrete tool call examples like bash(command='git log -5').
 
-Constraints: Do not add unnecessary content or restructure beyond what \
-is needed for improvement. Penalize yourself 15-20% for any structured \
-formatting. Focus on natural sentences.
+Length: no longer than 130% of the original prompt's length.
 
-Output ONLY the rewritten paragraph. No commentary, no fences, no \
-explanation of changes.\
+Output ONLY the rewritten prompt. No commentary, no fences.\
 """
 
 
@@ -760,8 +782,8 @@ def _observe_and_update_optimizer(
     if fence_match:
         result = fence_match.group(1).strip()
 
-    # Reject degenerate outputs (>150% of input length)
-    if len(result) > len(optimizer_system) * 1.5:
+    # Reject degenerate outputs (>200% of input length)
+    if len(result) > len(optimizer_system) * 2.0:
         _log(
             f"  Observer output too long ({len(result)} vs {len(optimizer_system)}), "
             "keeping current optimizer system",
@@ -958,6 +980,7 @@ def run_optimization(
         iter_result["iteration"] = iteration
         iter_result["prompt"] = current_prompt
         iter_result["prompt_diff"] = None
+        iter_result["optimizer_system"] = current_optimizer_system
         iter_result["timestamp"] = datetime.now().isoformat()
 
         results["iterations"].append(iter_result)
@@ -997,6 +1020,19 @@ def run_optimization(
                         opt_diff = _simple_diff(current_optimizer_system, new_opt)
                         _log(f"  Observer diff:\n{opt_diff}", dim=True)
                         current_optimizer_system = new_opt
+                        # Reset to the best-performing developer prompt so far.
+                        best_iter = max(
+                            results["iterations"],
+                            key=lambda it: it["aggregate"]["overall_pass_rate"],
+                        )
+                        best_rate = best_iter["aggregate"]["overall_pass_rate"]
+                        best_idx = best_iter["iteration"]
+                        current_prompt = best_iter["prompt"]
+                        _log(
+                            f"  Observer changed strategy → reset developer prompt "
+                            f"to best (iter {best_idx}, {best_rate:.0%})",
+                            dim=True,
+                        )
                     else:
                         _log("  Observer: no changes", dim=True)
                 except Exception as e:

@@ -49,7 +49,7 @@
         }
       },
       "expected_actions": [
-        { "tool": "search", "args_pattern": { "pattern": "test_" } }
+        { "tool": "search", "args_pattern": { "query": "test_" } }
       ],
       "match_mode": "subset"
     },
@@ -83,7 +83,7 @@
         }
       },
       "expected_actions": [
-        { "tool": "search", "args_pattern": { "pattern": "MAX_RETRIES" } },
+        { "tool": "search", "args_pattern": { "query": "MAX_RETRIES" } },
         { "tool": "read_file" },
         { "tool": "edit_file", "args_pattern": { "old_string": "3" } }
       ],
@@ -164,6 +164,15 @@
       "user_prompt": "Fetch the contents of https://example.com and summarize what's on the page",
       "expected_actions": [
         { "tool": "web_fetch", "args_pattern": { "url": "example\\.com" } }
+      ],
+      "match_mode": "subset"
+    },
+    {
+      "id": "man-page-lookup",
+      "description": "Use man tool to look up command documentation",
+      "user_prompt": "Look up the man page for tar and tell me what the --xattrs flag does",
+      "expected_actions": [
+        { "tool": "man", "args_pattern": { "page": "tar" } }
       ],
       "match_mode": "subset"
     }

@@ -221,7 +221,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "pattern": {
+                    "query": {
                         "type": "string",
                         "description": "Regex pattern to search for (extended regex).",
                     },
@@ -230,7 +230,7 @@ TOOLS = [
                         "description": "File or directory to search in (default: current directory).",
                     },
                 },
-                "required": ["pattern"],
+                "required": ["query"],
             },
         },
     },
@@ -287,6 +287,30 @@ TOOLS = [
                     },
                 },
                 "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "man",
+            "description": (
+                "Look up a man page or info page for a command, syscall, or "
+                "library function. Returns the formatted manual entry."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "string",
+                        "description": "The man page name (e.g. 'grep', 'socket', 'printf').",
+                    },
+                    "section": {
+                        "type": "string",
+                        "description": "Manual section (e.g. '1' commands, '2' syscalls, '3' library). Optional.",
+                    },
+                },
+                "required": ["page"],
             },
         },
     },
@@ -467,7 +491,7 @@ AGENT_TOOLS = [
     t
     for t in TOOLS
     if t["function"]["name"]
-    in ("read_file", "search", "math", "web_fetch", "web_search")
+    in ("read_file", "search", "math", "man", "web_fetch", "web_search")
 ]
 
 # Tools available to the task sub-agent (read + write + execute).
@@ -480,6 +504,7 @@ TASK_AGENT_TOOLS = [
         "read_file",
         "search",
         "math",
+        "man",
         "web_fetch",
         "web_search",
         "bash",
@@ -1292,17 +1317,24 @@ class ChatSession:
             ]
         else:
             dev_parts = [
-                "When you work with files, start by reading them to understand "
-                "what's there before making any changes. For new files, build "
-                "them directly with write_file. For existing ones, read first "
-                "and then edit. When you need to find something in the codebase, "
-                "search for it and then read the file where it's found. Use "
-                "plan when you need to think through multi-file changes before "
-                "implementing, and task when you need to delegate self-contained "
-                "work to a sub-agent. Run commands directly with bash, and run "
-                "tests with pytest. When you need to look something up online, "
-                "use web_search to find it and web_fetch to read a specific page. "
-                "When in doubt, read the file first before making changes.",
+                "Always respond with tool calls, not just text.\n\n"
+                "TOOL PATTERNS:\n\n"
+                "Modify existing file → read_file then edit_file:\n"
+                "   read_file(path='config.py') → "
+                "edit_file(path='config.py')\n\n"
+                "Create new file → write_file:\n"
+                "   write_file(path='hello.py', content='...')\n\n"
+                "Find something across files → search:\n"
+                "   search(query='test_')\n\n"
+                "Complex or multi-step task → plan first:\n"
+                "   plan(prompt='refactor database from API')\n\n"
+                "Run a command, git, or tests → bash:\n"
+                "   bash(command='git log -5')\n"
+                "   bash(command='pytest')\n\n"
+                "Retrieve a URL → web_fetch:\n"
+                "   web_fetch(url='https://example.com')\n\n"
+                "Look up documentation → man:\n"
+                "   man(page='tar')",
             ]
         if self.instructions:
             dev_parts.append("")
@@ -2082,9 +2114,10 @@ class ChatSession:
             "bash": "command",
             "math": "code",
             "read_file": "path",
-            "search": "pattern",
+            "search": "query",
             "write_file": "content",
             "edit_file": "old_string",
+            "man": "page",
             "web_fetch": "url",
             "web_search": "query",
             "task": "prompt",
@@ -2103,6 +2136,7 @@ class ChatSession:
                 "command",
                 "code",
                 "content",
+                "page",
                 "path",
                 "pattern",
                 "prompt",
@@ -2144,6 +2178,7 @@ class ChatSession:
             "write_file": self._prepare_write_file,
             "edit_file": self._prepare_edit_file,
             "math": self._prepare_math,
+            "man": self._prepare_man,
             "web_fetch": self._prepare_web_fetch,
             "web_search": self._prepare_web_search,
             "task": self._prepare_task,
@@ -2345,15 +2380,15 @@ class ChatSession:
         }
 
     def _prepare_search(self, call_id: str, args: dict) -> dict:
-        pattern = args.get("pattern", "")
+        pattern = args.get("query", "")
         if not pattern:
             return {
                 "call_id": call_id,
                 "func_name": "search",
-                "header": "✗ search: missing pattern",
+                "header": "✗ search: missing query",
                 "preview": "",
                 "needs_approval": False,
-                "error": "Error: missing pattern",
+                "error": "Error: missing query",
             }
         path = os.path.expanduser(args.get("path", "") or ".")
         preview = f"    {DIM}/{pattern}/ in {path}{RESET}"
@@ -2552,6 +2587,44 @@ class ChatSession:
             "approval_label": "math",
             "execute": self._exec_math,
             "code": code,
+        }
+
+    def _prepare_man(self, call_id: str, args: dict) -> dict:
+        """Prepare a man/info page lookup."""
+        page = (args.get("page") or "").strip()
+        if not page:
+            return {
+                "call_id": call_id,
+                "func_name": "man",
+                "header": "✗ man: empty page",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: no page name provided",
+            }
+        # Sanitize: only allow alphanumeric, dash, underscore, dot
+        if not re.match(r"^[a-zA-Z0-9._-]+$", page):
+            return {
+                "call_id": call_id,
+                "func_name": "man",
+                "header": "✗ man: invalid page name",
+                "preview": f"    {RED}{page}{RESET}",
+                "needs_approval": False,
+                "error": f"Error: invalid page name {page!r}",
+            }
+        section = (args.get("section") or "").strip()
+        if section and not re.match(r"^[1-9][a-z]?$", section):
+            section = ""
+        label = f"{page}({section})" if section else page
+        preview = f"    {DIM}{label}{RESET}"
+        return {
+            "call_id": call_id,
+            "func_name": "man",
+            "header": f"⚙ man: {label}",
+            "preview": preview,
+            "needs_approval": False,
+            "execute": self._exec_man,
+            "page": page,
+            "section": section,
         }
 
     def _prepare_web_fetch(self, call_id: str, args: dict) -> dict:
@@ -2951,7 +3024,14 @@ class ChatSession:
     # Tools the agent can auto-execute without user approval (read-only).
     # bash, write_file, edit_file are excluded — the user approval prompt
     # is the primary security boundary against prompt injection.
-    _AGENT_AUTO_TOOLS = {"read_file", "search", "math", "web_fetch", "web_search"}
+    _AGENT_AUTO_TOOLS = {
+        "read_file",
+        "search",
+        "math",
+        "man",
+        "web_fetch",
+        "web_search",
+    }
 
     def _run_agent(
         self,
@@ -3115,6 +3195,7 @@ class ChatSession:
         "read_file",
         "search",
         "math",
+        "man",
         "web_fetch",
         "web_search",
     }
@@ -3419,6 +3500,66 @@ class ChatSession:
         if is_error:
             return call_id, f"Error:\n{output}"
         return call_id, output if output else "(no output)"
+
+    def _exec_man(self, item: dict) -> tuple[str, str]:
+        """Look up a man or info page."""
+        call_id = item["call_id"]
+        page = item["page"]
+        section = item.get("section", "")
+
+        # Try man first, fall back to info
+        cmd = ["man"]
+        if section:
+            cmd.append(section)
+        cmd.append(page)
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env={**os.environ, "MANWIDTH": "80", "MAN_KEEP_FORMATTING": "0"},
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                # Strip formatting: backspace overstrikes and ANSI escapes
+                text = re.sub(r".\x08", "", result.stdout)
+                text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+            else:
+                # Fall back to info
+                result = subprocess.run(
+                    ["info", page],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    text = result.stdout
+                else:
+                    msg = f"No man or info page found for '{page}'"
+                    with self._print_lock:
+                        sys.stdout.write(f"    {DIM}{msg}{RESET}\n")
+                        sys.stdout.flush()
+                    return call_id, msg
+        except FileNotFoundError:
+            return call_id, "Error: man command not available"
+        except subprocess.TimeoutExpired:
+            return call_id, "Error: man page lookup timed out"
+
+        # Truncate very long pages
+        if len(text) > 30_000:
+            total = len(text)
+            text = (
+                text[:30_000]
+                + f"\n\n... [truncated: showing first 30000 of {total} chars. "
+                f"Use a specific section number to narrow results.]"
+            )
+
+        with self._print_lock:
+            sys.stdout.write(f"    {DIM}{len(text)} chars{RESET}\n")
+            sys.stdout.flush()
+
+        return call_id, text
 
     def _exec_web_fetch(self, item: dict) -> tuple[str, str]:
         """Fetch a URL, then summarize/extract using an API call."""
