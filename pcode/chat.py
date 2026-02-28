@@ -3932,8 +3932,8 @@ def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
-        help="Sampling temperature (default: 0.7)",
+        default=0.5,
+        help="Sampling temperature (default: 0.5)",
     )
     parser.add_argument(
         "--max-tokens",
@@ -3958,6 +3958,11 @@ def main():
         type=int,
         default=131072,
         help="Context window size in tokens (default: 131072)",
+    )
+    parser.add_argument(
+        "--skip-permissions",
+        action="store_true",
+        help="Auto-approve all tool calls (no confirmation prompts)",
     )
     args = parser.parse_args()
 
@@ -3988,6 +3993,8 @@ def main():
         reasoning_effort=args.reasoning_effort,
         context_window=args.context_window,
     )
+    if args.skip_permissions:
+        session.auto_approve = True
 
     # Print banner
     print(f"\n{bold('Chat')} with {cyan(model)}")
