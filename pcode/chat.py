@@ -2161,7 +2161,7 @@ class ChatSession:
                 if pk:
                     args = {pk: raw_args}
             if args is None:
-                preview = raw_args[:300] + ("..." if len(raw_args) > 300 else "")
+                preview = raw_args[:4000] + ("..." if len(raw_args) > 4000 else "")
                 return {
                     "call_id": call_id,
                     "func_name": func_name,
@@ -3964,15 +3964,21 @@ def main():
         action="store_true",
         help="Auto-approve all tool calls (no confirmation prompts)",
     )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key (default: $OPENAI_API_KEY, or 'dummy' for local servers)",
+    )
     args = parser.parse_args()
 
     # Set up readline
     setup_readline()
 
     # Create client
+    api_key = args.api_key or os.environ.get("OPENAI_API_KEY") or "dummy"
     client = OpenAI(
         base_url=args.base_url,
-        api_key=os.environ.get("OPENAI_API_KEY", "dummy"),
+        api_key=api_key,
     )
 
     # Detect or use provided model
